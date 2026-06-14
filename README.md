@@ -1,130 +1,189 @@
-﻿# GwyPilot — 公务员岗位决策与备考工作流 Agent
+# GwyPilot
 
-基于 [fastapi/full-stack-fastapi-template](https://github.com/fastapi/full-stack-fastapi-template) 二次开发。
+公务员岗位决策与备考辅助平台，基于 `fastapi/full-stack-fastapi-template` 二次开发。
 
-> 根据用户画像、职位表、专业目录、报考指南等数据，自动筛选适合岗位，解释匹配原因，标记风险，生成推荐报告和学习计划，并推送到飞书。
+项目目标是把结构化岗位筛选、政策知识检索、网页补证、风险提示、报告生成和学习计划串成一条可追踪的 Agent 工作流，帮助用户更快完成岗位判断和备考规划。
 
-## 核心能力
+## 当前能力
 
-```text
-结构化职位库 + 规则引擎 + Agentic RAG + 风险审查 + 记忆系统 + 飞书推送 + Agent Trace
-```
+- 结构化岗位库导入与筛选：岗位表进入 PostgreSQL，按专业、学历、学位、政治面貌、地区等条件做精确过滤
+- 政策与指南检索：政策公告、报考指南、专业目录进入 Milvus，供 Agentic RAG 检索
+- 岗位分析工作流：基于 LangGraph 串联岗位事实、政策证据、网页补证、风险审查和报告生成
+- 复习规划：根据用户背景、目标岗位和时间资源生成学习计划
+- 记忆系统：支持短期工作记忆和跨对话长期画像
+- 飞书推送：支持将分析报告或计划推送到飞书
+- 可追踪输出：保留分析轨迹、引用证据和中间结果
 
 ## 技术栈
 
-| 层级 | 技术 |
+| 模块 | 技术 |
 |------|------|
-| 后端框架 | FastAPI + Pydantic + SQLModel |
-| 数据库 | PostgreSQL（职位表） |
-| 向量库 | Milvus（政策、指南、专业目录） |
+| 后端 | FastAPI, SQLModel, Pydantic, LangGraph |
+| 结构化数据 | PostgreSQL |
+| 向量检索 | Milvus |
 | 缓存 | Redis |
-| Agent 编排 | LangGraph |
-| 前端 | React + TypeScript + Vite + Tailwind CSS + shadcn/ui |
-| 测试 | Pytest |
-| 部署 | Docker Compose + Traefik |
+| Web 检索 | SearXNG, Fetch MCP, Playwright MCP |
+| 文档处理 | PyMuPDF, pandas, openpyxl, OCR / multimodal summary |
+| 前端 | React, TypeScript, Vite |
+| 测试 | Pytest, Playwright |
 
-## 项目结构
+## 环境要求
 
-```
+- Python `3.10`
+- Node.js `20+`
+- Bun `1.x`
+- Docker Desktop / Docker Compose
+- PostgreSQL、Redis、Milvus 可通过 Docker 启动
+
+后端版本约束来自 [`backend/pyproject.toml`](./backend/pyproject.toml)，当前声明为 `>=3.10,<4.0`，Docker 镜像也基于 `python:3.10`。
+
+## 目录说明
+
+```text
 backend/app/
-├── gwy/                    # GwyPilot 核心模块
-│   ├── agents/             # Agent 实现（岗位决策、政策证据、风险审查、报告生成、飞书推送等）
-│   ├── document/           # 文档导入与解析
-│   ├── document_processing/ # 文档处理流水线
-│   ├── evals/              # 评测与质量保障
-│   ├── llm/                # LLM 调用封装
-│   ├── mcp_tools/          # MCP Tool 风格工具层
-│   ├── prompts/            # Prompt 模板
-│   ├── services/           # 业务服务层
-│   ├── skills/             # Agent 技能模块
-│   └── vectorstores/       # 向量库适配（Milvus）
-├── api/routes/
-│   ├── gwy.py              # GwyPilot API 路由
-│   └── gwy_analysis.py     # 岗位分析 API
-└── ...
-frontend/                   # React 前端（当前阶段不新增页面）
+├── api/routes/               API 路由
+├── gwy/
+│   ├── agents/               LangGraph Agent 编排
+│   ├── document/             PDF / 图片 / 表格解析
+│   ├── llm/                  模型调用封装
+│   ├── mcp_tools/            MCP Tool 风格工具层
+│   ├── prompts/              Prompt 模板
+│   ├── services/             业务服务
+│   ├── skills/               稳定规则与轻量推理
+│   └── vectorstores/         Milvus 适配
+frontend/                     React 前端
+docker/milvus/                Milvus 本地独立启动配置
+docs/                         方案、计划和补充文档
 ```
 
 ## 快速开始
 
-### 环境要求
+### 1. 安装依赖
 
-- Docker & Docker Compose
-- Python 3.12+
-- Node.js 20+ / Bun
-
-### 启动开发环境
+前端：
 
 ```bash
-# 启动全部服务（PostgreSQL、Milvus、Redis、后端、前端）
-docker compose watch
+npm install
+```
 
-# 或单独启动前后端
+后端：
+
+```bash
+cd backend
+pip install -e .
+```
+
+如果你平时用 `uv`，也可以在后端目录执行：
+
+```bash
+uv sync
+```
+
+### 2. 准备环境变量
+
+复制根目录 `.env.example` 为 `.env`，至少确认这些配置：
+
+- `POSTGRES_SERVER`
+- `POSTGRES_PORT`
+- `POSTGRES_DB`
+- `POSTGRES_USER`
+- `POSTGRES_PASSWORD`
+- `REDIS_URL`
+- `MILVUS_URI`
+- `SILICONFLOW_API_KEY` 或 `LLM_API_KEY`
+
+### 3. 启动依赖服务
+
+如果你本地单独跑 Milvus：
+
+```powershell
+cd docker/milvus
+docker compose up -d
+```
+
+如果你只想看日志：
+
+```powershell
+docker compose logs -f
+```
+
+PostgreSQL / Redis 可以按模板默认 Docker 方式启动，或者使用你自己的本地服务。
+
+### 4. 启动后端
+
+```powershell
+cd backend
+python -m uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload --reload-dir app
+```
+
+### 5. 启动前端
+
+在项目根目录执行：
+
+```powershell
 npm run dev -- --host 0.0.0.0 --port 5173
 ```
 
-启动后访问：
+## 访问地址
 
-| 服务 | 地址 |
-|------|------|
-| 前端 | http://localhost:5173 |
-| 后端 API | http://localhost:8000 |
-| Swagger 文档 | http://localhost:8000/docs |
-| Adminer（数据库管理） | http://localhost:8080 |
-| Traefik 面板 | http://localhost:8090 |
+- 前端：`http://localhost:5173`
+- 后端 API：`http://localhost:8000`
+- Swagger：`http://localhost:8000/docs`
+- Milvus：`http://localhost:19530`
 
-### 环境变量
+如果你使用模板里的完整 Docker 部署方式，还会额外用到：
 
-复制 `.env.example` 为 `.env`，按需修改配置。主要变量：
+- Adminer：`http://localhost:8080`
+- Traefik 面板：`http://localhost:8090`
 
-- `DOMAIN` — 部署域名（本地为 localhost）
-- `ENVIRONMENT` — 运行环境：`local` / `staging` / `production`
-- `FRONTEND_HOST` — 前端地址
+## 常用命令
 
-## 测试
+后端测试：
 
 ```bash
-# 后端测试
-cd backend && bash ./scripts/test.sh
+cd backend
+bash ./scripts/test.sh
+```
 
-# 后端 Lint
-cd backend && bash ./scripts/lint.sh
+后端 lint：
 
-# 后端格式化
-cd backend && bash ./scripts/format.sh
+```bash
+cd backend
+bash ./scripts/lint.sh
+```
 
-# 前端 Lint
+后端格式化：
+
+```bash
+cd backend
+bash ./scripts/format.sh
+```
+
+前端 lint：
+
+```bash
 bun run --filter frontend lint
+```
 
-# 前端测试
+前端测试：
+
+```bash
 bun run --filter frontend test
 ```
 
-## MVP 功能（第一阶段）
+## 当前实现边界
 
-- [x] 结构化岗位库导入（国考 / 省考 Excel）
-- [x] 政策文档、报考指南、专业目录导入
-- [x] Agentic RAG 知识检索（Milvus）
-- [x] 岗位匹配与决策 Agent
-- [x] 推荐报告生成
-- [x] 风险审查
-- [x] Agent Trace / 评测
-- [x] 飞书推送通知
+- 已实现：岗位筛选、政策检索、岗位分析、网页补证、学习计划、短长期记忆、飞书推送
+- 部分实现：图片 OCR / 多模态摘要能力已接入，但扫描类 PDF 和复杂版式仍有增强空间
+- 当前不做：自动报名、刷题系统、申论批改、面试陪练、MiniMind 微调
 
 ## 设计原则
 
-- **可解释**：每个推荐附带匹配原因与证据来源
-- **可追踪**：Agent 决策链完整记录
-- **可回放**：相同输入可复现相同结果
-- **结构化优先**：职位筛选走 PostgreSQL，RAG 只做知识检索
+- 结构化优先：岗位筛选依赖 PostgreSQL，不用 RAG 替代结构化过滤
+- 可解释：输出尽量带依据、理由和风险说明
+- 可追踪：保留 LangGraph 工作流中的关键步骤和证据来源
+- 可扩展：工具层按 MCP Tool 风格封装，便于后续接更多检索与执行能力
 
-## 许可
+## 说明
 
-本项目基于 [FastAPI Full Stack Template](https://github.com/fastapi/full-stack-fastapi-template) 构建，遵循其原有许可协议。
-
-## 致谢
-
-- [FastAPI](https://fastapi.tiangolo.com)
-- [full-stack-fastapi-template](https://github.com/fastapi/full-stack-fastapi-template)
-- [LangGraph](https://langchain.com/langgraph)
-- [Milvus](https://milvus.io)
+这个仓库是在 `fastapi/full-stack-fastapi-template` 基础上演化出来的公务员岗位分析项目，不再是模板原样使用。模板历史已经剥离，当前仓库以 GwyPilot 自身功能为主。
