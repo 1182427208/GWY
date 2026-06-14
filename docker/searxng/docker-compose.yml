@@ -1,0 +1,31 @@
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./docker/searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8080/
+    restart: unless-stopped
+
+  playwright-mcp:
+    image: mcr.microsoft.com/playwright/mcp:latest
+    container_name: playwright-mcp
+    entrypoint: ["node"]
+    command:
+      [
+        "/app/cli.js",
+        "--headless",
+        "--browser",
+        "chromium",
+        "--no-sandbox",
+        "--port",
+        "3000",
+        "--host",
+        "0.0.0.0"
+      ]
+    ports:
+      - "3001:3000"
+    restart: unless-stopped

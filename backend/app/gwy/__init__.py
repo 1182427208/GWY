@@ -1,0 +1,1 @@
+"""GwyPilot application extensions."""

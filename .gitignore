@@ -1,0 +1,42 @@
+# Environment
+.env
+.env.*
+!.env.example
+
+.vscode/*
+!.vscode/extensions.json
+node_modules/
+/frontend/.vite/
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+.playwright-cli/
+
+# Local reference repos and generated runtime artifacts
+giftia_ref/
+data/gwy_analysis_reports/
+backend/test-output-*.txt
+frontend/test-output-*.txt
+docker/milvus/volumes/
+
+# One-off local patch helpers
+scripts/_*.py
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+.pytest_cache/
+.pytest_tmp/
+.ruff_cache/
+.uv-cache/
+*.egg-info/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Copier
+.copier/
