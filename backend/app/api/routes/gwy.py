@@ -8,6 +8,8 @@ import tempfile
 from datetime import datetime
 from pathlib import Path
 from collections.abc import Iterator
+from queue import Empty, Queue
+from threading import Thread
 from uuid import uuid4
 from typing import Any, Literal
 from uuid import UUID
@@ -18,6 +20,7 @@ from pydantic import BaseModel, Field
 from sqlmodel import Session, select
 
 from app.api.deps import CurrentUser, SessionDep
+from app.core.db import engine
 from app.gwy.llm.embedding_service import EmbeddingService
 from app.gwy.agents.feishu_push_agent import FeishuPushAgent
 from app.gwy.llm.rerank_service import RerankService
@@ -46,20 +49,21 @@ from app.gwy.services.study_plan_service import StudyPlanService
 from app.gwy.document.pdf_loader import load_pdf_pages
 from app.gwy.services.policy_ingestion_service import PolicyIngestionService
 from app.gwy.services.policy_rag_service import PolicyRagService
+from app.gwy.services.autonomous_chat_agent_service import AutonomousChatAgentService
 from app.gwy.vectorstores.milvus_store import MilvusPolicyStore
 from app.models import Message
 
 router = APIRouter(prefix="/gwy", tags=["gwy"])
 logger = logging.getLogger(__name__)
 
-_STREAM_FLUSH_PUNCTUATION = set("。！？!?；;：:\n")
+_STREAM_FLUSH_PUNCTUATION = set("。！？；，、\n")
 _PIPELINE_STAGE_LABELS = {
     "route_intent": "意图识别",
     "position_recommendation": "岗位推荐",
     "rewrite_queries": "问题改写",
     "retrieve": "知识检索",
     "fuse_and_rerank": "融合重排",
-    "direct_answer": "直答生成",
+    "direct_answer": "直接回答",
     "answer": "回答生成",
     "finalize": "会话收尾",
 }
@@ -297,9 +301,11 @@ class PolicyQueryRequest(BaseModel):
     doc_type: str | None = None
     top_k: int = Field(default=6, ge=1, le=20)
     use_rerank: bool = True
-    mode: Literal["policy_rag", "position_recommendation"] | None = None
+    mode: Literal["policy_rag", "position_recommendation", "autonomous_agent"] | None = None
     intent_hint: str | None = None
     position_profile: PositionRecommendationProfile | None = None
+    snapshot: dict[str, Any] | None = None
+    position_analysis_task_id: UUID | None = None
 
 
 class ChatRequestBase(BaseModel):
@@ -310,7 +316,7 @@ class ChatRequestBase(BaseModel):
     doc_type: str | None = None
     top_k: int = Field(default=6, ge=1, le=20)
     use_rerank: bool = True
-    mode: Literal["policy_rag", "position_recommendation"] | None = None
+    mode: Literal["policy_rag", "position_recommendation", "autonomous_agent"] | None = None
     intent_hint: str | None = None
     position_profile: PositionRecommendationProfile | None = None
 
@@ -658,12 +664,12 @@ def get_position_page_state(
     payload = service.get_page_state(current_user.id)
     if not payload:
         return PositionPageState(
-            activeSheet="中央党群机关",
+            activeSheet="涓ぎ鍏氱兢鏈哄叧",
             sheets={
-                "中央党群机关": PositionPageSheetState(),
-                "中央国家行政机关（本级）": PositionPageSheetState(),
-                "中央国家行政机关省级以下直属机构": PositionPageSheetState(),
-                "中央国家行政机关参照公务员法管理事业单位": PositionPageSheetState(),
+                "涓ぎ鍏氱兢鏈哄叧": PositionPageSheetState(),
+                "涓ぎ鍥藉琛屾斂鏈哄叧锛堟湰绾э級": PositionPageSheetState(),
+                "涓ぎ鍥藉琛屾斂鏈哄叧鐪佺骇浠ヤ笅鐩村睘鏈烘瀯": PositionPageSheetState(),
+                "涓ぎ鍥藉琛屾斂鏈哄叧鍙傜収鍏姟鍛樻硶绠＄悊浜嬩笟鍗曚綅": PositionPageSheetState(),
             },
             savedSnapshots={},
         )
@@ -943,6 +949,141 @@ def create_chat_message_stream(
                 role="user",
                 content=payload.query,
             )
+            if payload.mode in {None, "autonomous_agent", "policy_rag"}:
+                current_stage = "autonomous_agent"
+                yield _sse_stage_event(
+                    "autonomous_agent",
+                    "running",
+                    detail="自主 Agent 正在规划、调用工具并生成回答",
+                    elapsed_ms=0,
+                )
+                agent_started_at = time.perf_counter()
+                trace_queue: Queue[dict[str, Any]] = Queue()
+                result_box: dict[str, Any] = {}
+                error_box: dict[str, BaseException] = {}
+                sent_trace_ids: set[str] = set()
+                position_profile = (
+                    payload.position_profile.model_dump(exclude_none=True)
+                    if payload.position_profile is not None
+                    else None
+                )
+
+                def on_agent_event(event: dict[str, Any]) -> None:
+                    trace_queue.put(event)
+
+                def run_autonomous_agent() -> None:
+                    try:
+                        with Session(engine) as worker_session:
+                            autonomous_service = AutonomousChatAgentService(
+                                session=worker_session,
+                            )
+                            result_box["result"] = autonomous_service.run(
+                                query=payload.query,
+                                user_id=current_user.id,
+                                session_id=session_id,
+                                year=payload.year,
+                                exam_type=payload.exam_type,
+                                top_k=payload.top_k,
+                                position_profile=position_profile,
+                                snapshot=payload.snapshot,
+                                position_analysis_task_id=payload.position_analysis_task_id,
+                                on_event=on_agent_event,
+                            )
+                    except BaseException as exc:  # pragma: no cover - stream guard
+                        error_box["error"] = exc
+                    finally:
+                        trace_queue.put({"__done__": True})
+
+                worker = Thread(
+                    target=run_autonomous_agent,
+                    name=f"gwy-autonomous-agent-{session_id}",
+                    daemon=True,
+                )
+                worker.start()
+                while True:
+                    try:
+                        item = trace_queue.get(timeout=0.25)
+                    except Empty:
+                        if worker.is_alive():
+                            continue
+                        break
+                    if item.get("__done__"):
+                        break
+                    trace_id = str(item.get("id") or "")
+                    if trace_id and trace_id in sent_trace_ids:
+                        continue
+                    if trace_id:
+                        sent_trace_ids.add(trace_id)
+                    yield _sse_event("trace", {"trace": item})
+                worker.join(timeout=1)
+                if error_box:
+                    error = error_box["error"]
+                    logger.error(
+                        "Autonomous agent stream failed",
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+                    yield _sse_stage_event(
+                        "autonomous_agent",
+                        "error",
+                        detail="自主 Agent 执行失败",
+                        elapsed_ms=_elapsed_ms(agent_started_at),
+                    )
+                    yield _sse_event(
+                        "error",
+                        {
+                            "stage": "autonomous_agent",
+                            "detail": str(error),
+                        },
+                    )
+                    return
+                result = dict(result_box.get("result") or {})
+                yield _sse_stage_event(
+                    "autonomous_agent",
+                    "done",
+                    detail="自主 Agent 已完成工具调用与回答整理",
+                    elapsed_ms=_elapsed_ms(agent_started_at),
+                )
+                for item in list(result.get("retrieval_trace") or []):
+                    trace_id = str(item.get("id") or "")
+                    if trace_id and trace_id in sent_trace_ids:
+                        continue
+                    if trace_id:
+                        sent_trace_ids.add(trace_id)
+                    yield _sse_event("trace", {"trace": item})
+                if str(result.get("report") or "").strip():
+                    yield _sse_event("report", {"report": str(result.get("report") or "")})
+                answer = service._normalize_answer_text(str(result.get("answer") or ""))
+                citations = list(result.get("citations") or [])
+                if citations:
+                    yield _sse_event("sources", {"citations": citations})
+                if answer.strip():
+                    yield from (
+                        _sse_event("delta", {"delta": chunk})
+                        for chunk in _batch_stream_chunks(iter([answer]))
+                    )
+                finalize_started_at = time.perf_counter()
+                yield _sse_stage_event(
+                    "finalize",
+                    "running",
+                    detail="正在保存自主 Agent 对话与报告",
+                    elapsed_ms=0,
+                )
+                payload_data = service.finalize_chat_turn(
+                    session_id=session_id,
+                    user_id=current_user.id,
+                    query=payload.query,
+                    user_message=service._serialize_message(user_message),
+                    result=result,
+                )
+                yield _sse_stage_event(
+                    "finalize",
+                    "done",
+                    detail="会话已保存",
+                    elapsed_ms=_elapsed_ms(finalize_started_at),
+                    total_elapsed_ms=_elapsed_ms(pipeline_started_at),
+                )
+                yield _sse_event("done", payload_data)
+                return
             state = {
                 "query": payload.query,
                 "session_id": str(session_id),
@@ -1073,7 +1214,7 @@ def create_chat_message_stream(
                 yield _sse_stage_event(
                     "direct_answer",
                     "running",
-                    detail="正在生成直答",
+                    detail="正在生成直接回答",
                     elapsed_ms=0,
                 )
                 answer_started_at = time.perf_counter()
@@ -1093,7 +1234,7 @@ def create_chat_message_stream(
                 yield _sse_stage_event(
                     "direct_answer",
                     "done",
-                    detail="已完成直答生成",
+                    detail="已完成直接回答生成",
                     elapsed_ms=_elapsed_ms(answer_started_at),
                 )
             else:
@@ -1149,7 +1290,7 @@ def create_chat_message_stream(
                 yield _sse_stage_event(
                     "react_evidence_review",
                     "running",
-                    detail="姝ｅ湪杩涜璇佹嵁琛ュ厖涓庡啀妫€",
+                    detail="正在复核证据是否足够支撑回答",
                     elapsed_ms=0,
                 )
                 current_stage = "react_evidence_review"
@@ -1157,7 +1298,7 @@ def create_chat_message_stream(
                 yield _sse_stage_event(
                     "react_evidence_review",
                     "done",
-                    detail="宸插畬鎴愯瘉鎹鍒拌涓烘鏌?",
+                    detail="已完成证据复核",
                     elapsed_ms=_elapsed_ms(react_started_at),
                 )
 
@@ -1657,14 +1798,15 @@ def _batch_stream_chunks(
         cleaned = chunk.replace("*", "")
         if not cleaned:
             continue
-        buffer += cleaned
-        if len(buffer) >= max_chars:
-            yield buffer
-            buffer = ""
-            continue
-        if len(buffer) >= min_chars and buffer[-1] in _STREAM_FLUSH_PUNCTUATION:
-            yield buffer
-            buffer = ""
+        for char in cleaned:
+            buffer += char
+            if len(buffer) >= max_chars:
+                yield buffer
+                buffer = ""
+                continue
+            if len(buffer) >= min_chars and buffer[-1] in _STREAM_FLUSH_PUNCTUATION:
+                yield buffer
+                buffer = ""
     if buffer:
         yield buffer
 
