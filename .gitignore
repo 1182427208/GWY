@@ -16,6 +16,7 @@ node_modules/
 
 # Local reference repos and generated runtime artifacts
 giftia_ref/
+.worktrees/
 data/gwy_analysis_reports/
 backend/test-output-*.txt
 frontend/test-output-*.txt
