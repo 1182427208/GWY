@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
 from uuid import UUID
 
@@ -28,6 +29,9 @@ from app.gwy.services.agent_memory_service import AgentMemoryService
 from app.gwy.services.long_term_memory_service import LongTermMemoryService
 from app.gwy.services.playwright_mcp_service import PlaywrightMCPService
 from app.gwy.services.position_catalog_service import PositionCatalogService
+from app.gwy.services.position_snapshot_runtime_service import (
+    PositionSnapshotRuntimeService,
+)
 from app.gwy.services.study_plan_service import StudyPlanService
 from app.gwy.services.web_fetch_service import WebFetchService
 from app.gwy.services.web_search_service import WebSearchService
@@ -58,6 +62,7 @@ class PositionAnalysisService:
         report_generator_agent: ReportGeneratorAgent | None = None,
         feishu_push_agent: FeishuPushAgent | None = None,
         chat_service: ChatService | None = None,
+        snapshot_runtime_service_factory: Callable[..., Any] | None = None,
     ) -> None:
         self.session = session
         self.decision_agent = decision_agent or PositionDecisionAgent(session=session)
@@ -75,6 +80,7 @@ class PositionAnalysisService:
             chat_service=chat_service,
         )
         self.feishu_push_agent = feishu_push_agent or FeishuPushAgent()
+        self.snapshot_runtime_service_factory = snapshot_runtime_service_factory
 
     def run(
         self,
@@ -208,10 +214,10 @@ class PositionAnalysisService:
             logger.exception("Failed to build memory context for analysis task")
 
         try:
-            result = self.agent.run(
-                snapshot_id=snapshot_row.id,
-                user_id=user_uuid,
-                task_id=task_row.id,
+            result = self._run_agent_analysis(
+                snapshot_row=snapshot_row,
+                task_row=task_row,
+                user_uuid=user_uuid,
                 user_profile=enriched_profile,
                 recommendation_context=recommendation_context,
             )
@@ -292,6 +298,73 @@ class PositionAnalysisService:
             "snapshot_id": str(snapshot_row.id),
             "task_id": str(task_row.id),
         }
+
+    def _run_agent_analysis(
+        self,
+        *,
+        snapshot_row: GwyPositionAnalysisSnapshot,
+        task_row: GwyPositionAnalysisTask,
+        user_uuid: UUID,
+        user_profile: dict[str, Any],
+        recommendation_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        try:
+            return self._run_snapshot_runtime_analysis(
+                snapshot_row=snapshot_row,
+                task_row=task_row,
+                user_uuid=user_uuid,
+                user_profile=user_profile,
+                recommendation_context=recommendation_context,
+            )
+        except Exception:
+            logger.exception(
+                "Snapshot runtime failed; falling back to legacy position analysis agent"
+            )
+            result = self.agent.run(
+                snapshot_id=snapshot_row.id,
+                user_id=user_uuid,
+                task_id=task_row.id,
+                user_profile=user_profile,
+                recommendation_context=recommendation_context,
+            )
+            result["trace"] = [
+                {
+                    "step": "snapshot_runtime_fallback",
+                    "status": "done",
+                    "detail": (
+                        "Snapshot AgentRuntime failed; legacy "
+                        "PositionAnalysisAgent completed the task."
+                    ),
+                },
+                *list(result.get("trace") or []),
+            ]
+            return result
+
+    def _run_snapshot_runtime_analysis(
+        self,
+        *,
+        snapshot_row: GwyPositionAnalysisSnapshot,
+        task_row: GwyPositionAnalysisTask,
+        user_uuid: UUID,
+        user_profile: dict[str, Any],
+        recommendation_context: dict[str, Any],
+    ) -> dict[str, Any]:
+        factory = self.snapshot_runtime_service_factory
+        runtime_service = (
+            factory(session=self.session)
+            if factory is not None
+            else PositionSnapshotRuntimeService(
+                session=self.session,
+                chat_service=getattr(self.agent, "chat_service", None),
+            )
+        )
+        return runtime_service.run(
+            snapshot=self._serialize_snapshot(snapshot_row),
+            user_id=user_uuid,
+            task_id=task_row.id,
+            user_profile=user_profile,
+            recommendation_context=recommendation_context,
+        )
 
     def _build_study_plan_result(
         self,
