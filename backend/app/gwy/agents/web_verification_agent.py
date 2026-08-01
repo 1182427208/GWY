@@ -8,6 +8,7 @@ from langgraph.graph import END, START, StateGraph
 
 from app.gwy.services.playwright_mcp_service import PlaywrightMCPService
 from app.gwy.services.web_fetch_service import WebFetchService
+from app.gwy.services.web_research_service import WebResearchRequest, WebResearchService
 from app.gwy.services.web_search_service import WebSearchService
 
 
@@ -29,12 +30,18 @@ class WebVerificationAgent:
     web_search_service: WebSearchService | None = None
     web_fetch_service: WebFetchService | None = None
     browser_service: PlaywrightMCPService | None = None
+    research_service: WebResearchService | None = None
     graph: Any = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.web_search_service = self.web_search_service or WebSearchService()
         self.web_fetch_service = self.web_fetch_service or WebFetchService()
         self.browser_service = self.browser_service or PlaywrightMCPService()
+        self.research_service = self.research_service or WebResearchService(
+            search_service=self.web_search_service,
+            fetch_service=self.web_fetch_service,
+            browser_service=self.browser_service,
+        )
         self.graph = self._build_graph()
 
     def run(
@@ -61,7 +68,7 @@ class WebVerificationAgent:
     def _build_graph(self) -> Any:
         builder = StateGraph(WebVerificationState)
         builder.add_node("plan", self._node_plan)
-        builder.add_node("search", self._node_search)
+        builder.add_node("search", self._node_search_shared)
         builder.add_node("observe", self._node_observe)
         builder.add_edge(START, "plan")
         builder.add_edge("plan", "search")
@@ -127,6 +134,43 @@ class WebVerificationAgent:
             }
         )
         return {"search_queries": queries, "trace": trace}
+
+    def _node_search_shared(self, state: WebVerificationState) -> dict[str, Any]:
+        position = dict(state.get("position") or {})
+        history_summary = dict(state.get("history_summary") or {})
+        scope = dict(state.get("scope") or {})
+        queries = list(state.get("search_queries") or [])
+        request = WebResearchRequest(
+            query=queries[0] if queries else "岗位网页核验",
+            planned_queries=queries[1:],
+            position=position,
+            top_k=3,
+            max_queries=3,
+        )
+        result = self.research_service.verify(request)
+        web_results = [
+            {
+                "query": queries[0] if queries else request.query,
+                "title": item.title,
+                "url": item.url,
+                "snippet": item.excerpt[:220],
+                "source": "official" if item.credibility == "high" else "web",
+                "content": item.text,
+                "content_type": "application/pdf" if item.evidence_type == "pdf" else "text/html",
+                "retrieved_via": item.retrieved_via,
+                "final_url": item.final_url,
+                "is_pdf": item.evidence_type == "pdf",
+            }
+            for item in result.evidence[:5]
+        ]
+        return {
+            "web_results": web_results,
+            "web_search_attempts": result.attempts,
+            "trace": [*list(state.get("trace") or []), *result.trace],
+            "position": position,
+            "history_summary": history_summary,
+            "scope": scope,
+        }
 
     def _node_search(self, state: WebVerificationState) -> dict[str, Any]:
         position = dict(state.get("position") or {})
