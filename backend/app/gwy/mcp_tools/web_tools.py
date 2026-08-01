@@ -4,6 +4,7 @@ from typing import Any
 
 from app.gwy.services.playwright_mcp_service import PlaywrightMCPService
 from app.gwy.services.web_fetch_service import WebFetchService
+from app.gwy.services.web_research_service import WebResearchRequest, WebResearchService
 from app.gwy.services.web_search_service import WebSearchService
 
 
@@ -17,3 +18,19 @@ def fetch_web_page_mcp(url: str) -> dict[str, Any]:
 
 def read_web_page_playwright_mcp(url: str) -> dict[str, Any]:
     return PlaywrightMCPService().read(url)
+
+
+def verify_web_evidence_mcp(
+    query: str,
+    *,
+    planned_queries: list[str] | None = None,
+    top_k: int = 3,
+) -> dict[str, Any]:
+    result = WebResearchService().verify(
+        WebResearchRequest(
+            query=query,
+            planned_queries=list(planned_queries or []),
+            top_k=top_k,
+        )
+    )
+    return result.as_dict()

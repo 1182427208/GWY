@@ -17,14 +17,17 @@ from app.gwy.llm.chat_service import ChatService
 from app.gwy.llm.embedding_service import EmbeddingService
 from app.gwy.llm.rerank_service import RerankService
 from app.gwy.models import GwyUserProfile
-from app.gwy.skills.policy_rag_skills import build_metadata_filter_skill
 from app.gwy.services.agent_memory_service import AgentMemoryService
 from app.gwy.services.policy_rag_service import PolicyRagService
 from app.gwy.services.position_snapshot_runtime_service import (
     PositionSnapshotRuntimeService,
 )
+from app.gwy.services.web_research_service import (
+    WebResearchRequest,
+    WebResearchService,
+)
+from app.gwy.skills.policy_rag_skills import build_metadata_filter_skill
 from app.gwy.vectorstores.milvus_store import MilvusPolicyStore
-
 
 AUTONOMOUS_AGENT_SYSTEM_PROMPT = """
 你是 GwyPilot 的自主公务员考试助手，工作方式必须接近 learn-claude-code 的 agent loop。
@@ -70,9 +73,11 @@ class AutonomousChatAgentService:
         *,
         session: Session,
         chat_service: ChatService | None = None,
+        web_research_service: WebResearchService | None = None,
     ) -> None:
         self.session = session
         self.chat_service = chat_service or ChatService()
+        self.web_research_service = web_research_service or WebResearchService()
         self.embedding_service = EmbeddingService()
         self.rerank_service = RerankService()
         self.milvus_store = MilvusPolicyStore()
@@ -402,6 +407,61 @@ class AutonomousChatAgentService:
         register_builtin_tools(registry)
         registry.register(
             ToolSpec(
+                name="search_web",
+                description="Search the public web for candidate pages; use verify_web_evidence for normal user flows.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
+                    },
+                    "required": ["query"],
+                },
+                handler=self._tool_search_web,
+            )
+        )
+        registry.register(
+            ToolSpec(
+                name="fetch_web_page",
+                description="Fetch one public HTTP or HTTPS page for internal evidence verification.",
+                parameters={
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                },
+                handler=self._tool_fetch_web_page,
+            )
+        )
+        registry.register(
+            ToolSpec(
+                name="read_web_page",
+                description="Read a JavaScript-rendered public page through browser or MCP fallback.",
+                parameters={
+                    "type": "object",
+                    "properties": {"url": {"type": "string"}},
+                    "required": ["url"],
+                },
+                handler=self._tool_read_web_page,
+            )
+        )
+        registry.register(
+            ToolSpec(
+                name="verify_web_evidence",
+                description="Search, fetch, render when needed, and return traceable web evidence for a position or policy question.",
+                parameters={
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "planned_queries": {"type": "array", "items": {"type": "string"}},
+                        "top_k": {"type": "integer", "minimum": 1, "maximum": 10},
+                    },
+                    "required": ["query"],
+                },
+                handler=self._tool_verify_web_evidence,
+            )
+        )
+        registry.register(
+            ToolSpec(
                 name="search_policy_knowledge",
                 description=(
                     "Search policy documents, announcements, exam guides, and major catalogs. "
@@ -486,6 +546,47 @@ class AutonomousChatAgentService:
             )
         )
         return registry
+
+    def _tool_search_web(self, args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+        query = str(args.get("query") or context.state.get("query") or "").strip()
+        results = self.web_research_service.search_service.search(
+            query,
+            top_k=int(args.get("top_k") or 5),
+        )
+        return {"query": query, "results": list(results or [])[:10]}
+
+    def _tool_fetch_web_page(self, args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+        url = str(args.get("url") or "").strip()
+        result = self.web_research_service.fetch_service.fetch(url)
+        return {"url": url, **dict(result or {})}
+
+    def _tool_read_web_page(self, args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+        url = str(args.get("url") or "").strip()
+        result = self.web_research_service.browser_service.read(url)
+        return {"url": url, **dict(result or {})}
+
+    def _tool_verify_web_evidence(self, args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
+        query = str(args.get("query") or context.state.get("query") or "").strip()
+        result = self.web_research_service.verify(
+            WebResearchRequest(
+                query=query,
+                planned_queries=[str(item) for item in list(args.get("planned_queries") or [])],
+                position=dict(context.state.get("position") or {}),
+                top_k=int(args.get("top_k") or 3),
+            )
+        )
+        for event in result.trace:
+            context.record_event(
+                event="WebResearchStep",
+                status=str(event.get("status") or "done"),
+                step=str(event.get("step") or "web_research"),
+                tool="verify_web_evidence",
+                output=dict(event.get("outputs_summary") or {}),
+            )
+        payload = result.as_dict()
+        context.state["web_evidence"] = payload["evidence"]
+        context.state["web_trace"] = payload["trace"]
+        return payload
 
     def _tool_search_policy_knowledge(
         self,

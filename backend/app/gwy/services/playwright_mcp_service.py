@@ -70,26 +70,36 @@ class PlaywrightMCPService:
                     return self._normalize_mcp_result(result, url, tool_name)
 
     def _select_mcp_tool_name(self, tools: list[Any]) -> str | None:
-        priority_keywords = (
-            "read",
-            "snapshot",
-            "page",
-            "browser",
-            "open",
-            "navigate",
-            "goto",
-        )
+        candidates = ("url", "target", "page_url", "href", "input")
+        ranked: list[tuple[int, str]] = []
         for tool in tools:
             name = str(getattr(tool, "name", "") or "").strip()
             if not name:
                 continue
-            lowered = name.lower()
-            if any(keyword in lowered for keyword in priority_keywords):
-                return name
-        if not tools:
+            schema = dict(getattr(tool, "inputSchema", {}) or {})
+            properties = dict(schema.get("properties") or {})
+            required = set(schema.get("required") or [])
+            matching_fields = [field for field in candidates if field in properties]
+            if not matching_fields:
+                continue
+            description = str(getattr(tool, "description", "") or "").lower()
+            score = 0
+            if any(field in required for field in matching_fields):
+                score += 4
+            if any(
+                keyword in description
+                for keyword in ("read", "page", "browser", "navigate", "open", "snapshot")
+            ):
+                score += 2
+            if any(
+                keyword in name.lower()
+                for keyword in ("read", "page", "browser", "navigate", "open", "snapshot")
+            ):
+                score += 1
+            ranked.append((score, name))
+        if not ranked:
             return None
-        fallback_name = str(getattr(tools[0], "name", "") or "").strip()
-        return fallback_name or None
+        return max(ranked, key=lambda item: item[0])[1]
 
     def _build_mcp_arguments(
         self,
@@ -107,10 +117,7 @@ class PlaywrightMCPService:
         for key in candidates:
             if key in properties:
                 return {key: url}
-        if properties:
-            first_key = next(iter(properties.keys()))
-            return {first_key: url}
-        return {"url": url}
+        return {}
 
     def _normalize_mcp_result(
         self,
