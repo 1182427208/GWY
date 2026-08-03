@@ -18,10 +18,19 @@ class FakeChatService:
         return self.response
 
 
-def test_search_query_planner_expands_competition_query_to_official_candidates() -> None:
+def test_search_query_planner_emits_distinct_trace_steps_for_llm_path() -> None:
     planner = SearchQueryPlannerService(
         chat_service=FakeChatService(
-            response='{"primary_query":"100110001001 2026 报录比 进面分 官方公告","planned_queries":["100110001001 2026 报录比","100110001001 进面分 官方公告","100110001001 site:gov.cn 招录 公告"],"required_source_kinds":["official"],"search_kind":"web","trace_notes":"优先官方来源"}'
+            response=(
+                '{"primary_query":"100110001001 2026 报录比 进面分 官方公告",'
+                '"planned_queries":['
+                '"100110001001 2026 报录比 官方公告",'
+                '"100110001001 进面分 官方公告",'
+                '"100110001001 site:gov.cn 招录 公告"],'
+                '"required_source_kinds":["official"],'
+                '"search_kind":"web",'
+                '"trace_notes":"prefer official sources"}'
+            )
         )
     )
 
@@ -37,16 +46,48 @@ def test_search_query_planner_expands_competition_query_to_official_candidates()
         )
     )
 
-    assert result.search_kind == "web"
+    assert [entry["step"] for entry in result.trace] == [
+        "search_query_planning_started",
+        "search_query_rewritten",
+        "search_query_finalized",
+    ]
+    assert result.trace[0]["input"]["original_query"] == "100110001001 2026报录比 进面人数 进面分"
+    assert result.trace[1]["output"]["original_query"] == "100110001001 2026报录比 进面人数 进面分"
+    assert result.trace[1]["output"]["primary_query"].startswith("100110001001")
+    assert result.trace[2]["tool"] == "web_search"
     assert result.required_source_kinds == ["official"]
-    assert result.primary_query.startswith("100110001001")
-    assert any("官方公告" in item for item in result.planned_queries)
 
 
-def test_search_query_planner_falls_back_when_llm_output_is_invalid() -> None:
-    planner = SearchQueryPlannerService(
-        chat_service=FakeChatService(response="not-json")
+def test_search_query_planner_fallback_keeps_original_query_when_candidates_are_full() -> None:
+    planner = SearchQueryPlannerService(chat_service=FakeChatService(response="not-json"))
+    request = SearchQueryRequest(
+        query="2026 进面分",
+        search_kind="web",
+        planned_queries=[
+            "候选一",
+            "候选二",
+            "候选三",
+            "候选四",
+            "候选五",
+        ],
+        position={"department_name": "某部门", "job_title": "某岗位"},
     )
+
+    result = planner.plan(request)
+
+    assert result.planned_queries[0] == "2026 进面分"
+    assert "2026 进面分" in result.planned_queries
+    assert [entry["step"] for entry in result.trace] == [
+        "search_query_planning_started",
+        "search_query_rewrite_failed",
+        "search_query_finalized",
+    ]
+    assert result.trace[1]["error"] == "planner response must be valid JSON"
+    assert result.trace[2]["output"]["strategy"] == "fallback_rules"
+
+
+def test_search_query_planner_preserves_original_query_when_llm_output_is_invalid() -> None:
+    planner = SearchQueryPlannerService(chat_service=FakeChatService(response="not-json"))
 
     result = planner.plan(
         SearchQueryRequest(
@@ -56,6 +97,5 @@ def test_search_query_planner_falls_back_when_llm_output_is_invalid() -> None:
         )
     )
 
-    assert result.planned_queries
-    assert "2026" in result.primary_query
-    assert result.trace[-1]["strategy"] == "fallback_rules"
+    assert result.planned_queries[0] == "2026 进面分"
+    assert result.primary_query == "2026 进面分"

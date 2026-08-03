@@ -34,3 +34,8 @@
 - 政策、报考指南、专业目录进入 Milvus，供 Agentic RAG 使用
 - 主流程使用 LangGraph，工具层按 MCP Tool 风格封装，不直接在 Agent 中散落 function call
 - 第一阶段只做 MVP，不做自动报名、刷题、申论批改、面试陪练、MiniMind 微调
+## Search Query Planner
+- 入口：pp.gwy.services.search_query_planner_service.SearchQueryPlannerService.plan。
+- 输入：SearchQueryRequest 的 query、search_kind、可选 position、已有 planned_queries 和 max_queries。
+- 输出：SearchQueryPlan，包含 primary_query、planned_queries、equired_source_kinds、search_kind 和可回放的 	race。
+- Planner 使用 ChatService 生成 JSON 查询候选；模型输出不可解析或不可用时，自动回退到确定性规则，不中断调用。
