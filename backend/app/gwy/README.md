@@ -39,3 +39,8 @@
 - 输入：SearchQueryRequest 的 query、search_kind、可选 position、已有 planned_queries 和 max_queries。
 - 输出：SearchQueryPlan，包含 primary_query、planned_queries、equired_source_kinds、search_kind 和可回放的 	race。
 - Planner 使用 ChatService 生成 JSON 查询候选；模型输出不可解析或不可用时，自动回退到确定性规则，不中断调用。
+## Search Query Planner
+- 入口：pp.gwy.services.search_query_planner_service.SearchQueryPlannerService.plan。
+- 输入：SearchQueryRequest 的 query、search_kind、可选 position、已有 planned_queries 和 max_queries。
+- 输出：SearchQueryPlan，包含 primary_query、planned_queries、equired_source_kinds、search_kind 和可回放的 	race。
+- Planner 使用 ChatService 生成 JSON 查询候选；模型输出不可解析或不可用时，自动回退到确定性规则，不中断调用。

@@ -53,7 +53,8 @@ def test_search_query_planner_emits_distinct_trace_steps_for_llm_path() -> None:
     ]
     assert result.trace[0]["input"]["original_query"] == "100110001001 2026报录比 进面人数 进面分"
     assert result.trace[1]["output"]["original_query"] == "100110001001 2026报录比 进面人数 进面分"
-    assert result.trace[1]["output"]["primary_query"].startswith("100110001001")
+    assert result.trace[1]["output"]["primary_query"] == "100110001001 2026 报录比 进面分 官方公告"
+    assert result.planned_queries[0] == "100110001001 2026 报录比 进面分 官方公告"
     assert result.trace[2]["tool"] == "web_search"
     assert result.required_source_kinds == ["official"]
 

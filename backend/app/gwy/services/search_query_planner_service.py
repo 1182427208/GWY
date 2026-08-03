@@ -95,7 +95,11 @@ class SearchQueryPlannerService:
         sources = self._texts(payload.get("required_source_kinds")) or self._default_sources(
             search_kind
         )
-        candidates = self._normalize_candidates([primary, *candidates], request)
+        candidates = self._normalize_candidates(
+            [primary, *candidates, request.query],
+            request,
+            keep_original_first=False,
+        )
 
         self._trace_rewritten(
             trace,
@@ -152,7 +156,11 @@ class SearchQueryPlannerService:
         else:
             candidates.append(base)
 
-        candidates = self._normalize_candidates(candidates, request)
+        candidates = self._normalize_candidates(
+            candidates,
+            request,
+            keep_original_first=True,
+        )
         self._trace_rewrite_failed(trace, error=error, request=request)
         self._trace_finalized(
             trace,
@@ -175,14 +183,18 @@ class SearchQueryPlannerService:
         self,
         candidates: list[str],
         request: SearchQueryRequest,
+        *,
+        keep_original_first: bool,
     ) -> list[str]:
         limit = self._limit(request)
         normalized = self._unique([self._text(item) for item in candidates if self._text(item)])
         original = self._text(request.query)
-        if original and original not in normalized:
+        if original and keep_original_first and original not in normalized:
             normalized.insert(0, original)
-        elif original:
+        elif original and keep_original_first:
             normalized = [original, *[item for item in normalized if item != original]]
+        elif original and original not in normalized:
+            normalized.append(original)
         return normalized[:limit]
 
     @staticmethod
