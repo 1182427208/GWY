@@ -142,7 +142,7 @@ class SearchQueryPlannerService:
             ]
         )
         base = " ".join([*context, request.query]).strip()
-        candidates = [request.query.strip(), base]
+        candidates = [request.query.strip(), *request.planned_queries, base]
         if request.search_kind == "web":
             candidates.extend(
                 [

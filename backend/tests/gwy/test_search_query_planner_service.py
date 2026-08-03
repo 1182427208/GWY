@@ -78,6 +78,7 @@ def test_search_query_planner_fallback_keeps_original_query_when_candidates_are_
 
     assert result.planned_queries[0] == "2026 进面分"
     assert "2026 进面分" in result.planned_queries
+    assert "候选一" in result.planned_queries
     assert [entry["step"] for entry in result.trace] == [
         "search_query_planning_started",
         "search_query_rewrite_failed",
