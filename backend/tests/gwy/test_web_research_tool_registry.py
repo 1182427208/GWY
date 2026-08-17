@@ -27,3 +27,8 @@ def test_autonomous_registry_contains_web_research_tools() -> None:
     assert registry.get("fetch_web_page") is not None
     assert registry.get("read_web_page") is not None
     assert registry.get("verify_web_evidence") is not None
+    assert registry.get("web_search") is not None
+    assert registry.get("web_fetch") is not None
+    assert registry.get("browser_retrieve") is not None
+    assert registry.get("list_tables") is not None
+    assert registry.get("query_sql") is not None

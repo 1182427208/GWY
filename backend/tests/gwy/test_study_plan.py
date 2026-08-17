@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
 from uuid import uuid4
 
-import pytest
-
+from app.gwy.agents.study_plan_agent import StudyPlanAgent
 from app.gwy.skills.study_plan_skills import (
     analyze_exam_subjects,
     build_subject_checklist,
@@ -14,7 +12,6 @@ from app.gwy.skills.study_plan_skills import (
     format_study_plan_markdown,
     generate_phase_schedule,
 )
-from app.gwy.agents.study_plan_agent import StudyPlanAgent
 
 
 class TestStudyPlanSkills:

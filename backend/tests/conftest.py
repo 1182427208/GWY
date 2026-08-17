@@ -17,6 +17,9 @@ from app.gwy.models import (
     GwyChatSession,
     GwyConversationMemory,
     GwyDecisionMemory,
+    GwyEvalCaseResult,
+    GwyEvalDataset,
+    GwyEvalRun,
     GwyExperienceMemory,
     GwyHumanReview,
     GwyPdfAsset,
@@ -61,6 +64,9 @@ def db() -> Generator[Session, None, None]:
         yield session
         session.execute(delete(Item))
         for model in (
+            GwyEvalCaseResult,
+            GwyEvalRun,
+            GwyEvalDataset,
             GwyToolCall,
             GwyAgentStep,
             GwyAgentRun,

@@ -39,7 +39,7 @@ AUTONOMOUS_AGENT_SYSTEM_PROMPT = """
 4. 是否需要继续检索、核验、生成复习规划或直接回答。
 
 工作规则：
-- 对任何非寒暄任务，先调用 `todo_write` 写出 2-5 步计划，并在关键步骤后更新。
+- 对任何非寒暄任务，先调用 `todo_tasks`（兼容 `todo_write`）写出 2-5 步计划，并在关键步骤后更新。
 - 政策、公告、报考指南、准考证、报名、资格条件、专业目录等问题，调用 `search_policy_knowledge` 检索证据，再调用 `compose_policy_answer` 生成回答。
 - 岗位推荐、岗位匹配、备考规划问题，调用 `load_skill` 加载 `position-planning`，再用 `search_positions_pg` 做结构化岗位筛选；不要用 RAG 替代岗位过滤。
 - 岗位推荐后，如需要风险或限制核验，调用 `review_position_risks`；如需要复习计划，调用 `generate_study_plan`。
@@ -57,7 +57,7 @@ CLEAN_AUTONOMOUS_AGENT_SYSTEM_PROMPT = """
 4. 是否需要继续检索、核验、生成复习规划或直接回答。
 
 工作规则：
-- 对任何非简单任务，先调用 `todo_write` 写出 2-5 步计划，并在关键步骤后更新。
+- 对任何非简单任务，先调用 `todo_tasks`（兼容 `todo_write`）写出 2-5 步计划，并在关键步骤后更新。
 - 政策、公告、报考指南、准考证、报名、资格条件、专业目录等问题，调用 `search_policy_knowledge` 检索证据，再调用 `compose_policy_answer` 生成回答。
 - 岗位推荐、岗位匹配、备考规划问题，调用 `load_skill` 加载 `position-planning`，再用 `search_positions_pg` 做结构化岗位筛选；不要用 RAG 替代岗位过滤。
 - 岗位推荐后，如需风险或限制核验，调用 `review_position_risks`；如需复习计划，调用 `generate_study_plan`。
@@ -65,6 +65,19 @@ CLEAN_AUTONOMOUS_AGENT_SYSTEM_PROMPT = """
 - 最终回答只输出面向用户的中文 Markdown；不要暴露内部 JSON。
 - 不要编造政策、岗位条件、时间、分数线或公告来源；证据不足就明确说明。
 """.strip()
+
+
+MCP_TOOL_PRIORITY_PROMPT = """
+
+MCP 工具优先级：
+- 公共网页证据核验时，优先用统一 Web MCP：`web_search` -> `web_fetch` / `browser_retrieve` -> `verify_web_evidence`。
+- 数据库结构和数据核验时，优先用 DB MCP：`list_tables` -> `describe_table` / `sample_rows` -> `query_sql`。
+- 只有当 MCP 无法满足时，才回退到本地推理或已有业务工具。
+- 不要跳过工具直接编造证据、表结构、行数据或查询结果。
+""".strip()
+
+AUTONOMOUS_AGENT_SYSTEM_PROMPT += MCP_TOOL_PRIORITY_PROMPT
+CLEAN_AUTONOMOUS_AGENT_SYSTEM_PROMPT += MCP_TOOL_PRIORITY_PROMPT
 
 
 class AutonomousChatAgentService:
@@ -117,6 +130,13 @@ class AutonomousChatAgentService:
         on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         profile = position_profile or self._load_user_profile(user_id)
+        try:
+            session_attachments = self.policy_service._load_session_attachments(
+                session_id=session_id,
+                user_id=user_id,
+            )
+        except Exception:
+            session_attachments = []
         context = {
             "query": query,
             "user_id": str(user_id),
@@ -129,6 +149,7 @@ class AutonomousChatAgentService:
             "position_analysis_task_id": (
                 str(position_analysis_task_id) if position_analysis_task_id else None
             ),
+            "session_attachments": session_attachments,
         }
         if self._looks_like_position_recommendation(query):
             if not self._has_snapshot_context(context):
@@ -159,7 +180,13 @@ class AutonomousChatAgentService:
             memory_service=memory_service,
         )
         try:
-            result = runtime.run(user_prompt=query, context=context)
+            result = runtime.run(
+                user_prompt=self._build_attachment_aware_prompt(
+                    query=query,
+                    attachments=session_attachments,
+                ),
+                context=context,
+            )
             state = result.state
             trace = result.trace
             answer = result.answer
@@ -194,6 +221,8 @@ class AutonomousChatAgentService:
             "intent": str(state.get("intent") or "autonomous_agent"),
             "need_rag": bool(state.get("need_rag", True)),
             "decision_branch": "autonomous_agent_runtime",
+            "task_contract": dict(state.get("task_contract") or {}),
+            "validation": dict(state.get("validation") or {}),
             "citations": list(state.get("citations") or []),
             "retrieval_trace": trace,
             "rewritten_queries": list(state.get("rewritten_queries") or []),
@@ -209,6 +238,35 @@ class AutonomousChatAgentService:
             "historical_reference": False,
             "session_attachments": list(state.get("session_attachments") or []),
         }
+
+    def _build_attachment_aware_prompt(
+        self,
+        *,
+        query: str,
+        attachments: list[dict[str, Any]],
+    ) -> str:
+        if not attachments:
+            return query
+
+        blocks: list[str] = []
+        for attachment in attachments:
+            name = str(
+                attachment.get("original_name")
+                or attachment.get("file_name")
+                or "未命名附件"
+            )
+            attachment_type = str(attachment.get("attachment_type") or "附件")
+            summary = str(attachment.get("summary") or "").strip()
+            extracted_text = str(attachment.get("extracted_text") or "").strip()
+            content = extracted_text or summary or "附件已上传，但尚未提取出内容。"
+            blocks.append(
+                f"附件：{name}\n类型：{attachment_type}\n内容摘要：{content[:5000]}"
+            )
+
+        return (
+            f"{query}\n\n用户已上传以下附件，请优先基于附件内容回答，不能说没有收到附件：\n"
+            + "\n\n".join(blocks)
+        )
 
     def _looks_like_position_recommendation(self, query: str) -> bool:
         keywords = (
@@ -263,6 +321,8 @@ class AutonomousChatAgentService:
             "recommendation_task_id": None,
             "historical_reference": False,
             "session_attachments": [],
+            "task_contract": {},
+            "validation": {},
         }
 
     def _run_snapshot_position_analysis(
@@ -308,6 +368,8 @@ class AutonomousChatAgentService:
             "recommendation_task_id": result.get("task_id"),
             "historical_reference": False,
             "session_attachments": [],
+            "task_contract": dict(result.get("task_contract") or {}),
+            "validation": dict(result.get("validation") or {}),
         }
 
     def _run_deterministic_fallback(
@@ -547,6 +609,44 @@ class AutonomousChatAgentService:
         )
         return registry
 
+    def _record_subagent_run(
+        self,
+        *,
+        context: ToolContext,
+        subagent_name: str,
+        wrapper_tool: str,
+        trace: list[dict[str, Any]] | None,
+        input_summary: dict[str, Any] | None = None,
+        output_summary: dict[str, Any] | None = None,
+        event_name: str = "SubAgentToolUse",
+    ) -> None:
+        context.record_event(
+            event="SubAgentStart",
+            status="running",
+            step=wrapper_tool,
+            tool=subagent_name,
+            detail=f"{subagent_name} started from {wrapper_tool}.",
+            input=input_summary or {},
+        )
+        for item in list(trace or []):
+            context.record_event(
+                event=event_name,
+                status=str(item.get("status") or "done"),
+                step=str(item.get("step") or item.get("event") or wrapper_tool),
+                tool=subagent_name,
+                detail=str(item.get("detail") or f"{subagent_name} step."),
+                input=dict(item.get("inputs_summary") or item.get("input") or {}),
+                output=dict(item.get("outputs_summary") or item.get("output") or {}),
+            )
+        context.record_event(
+            event="SubAgentEnd",
+            status="done",
+            step=wrapper_tool,
+            tool=subagent_name,
+            detail=f"{subagent_name} finished for {wrapper_tool}.",
+            output=output_summary or {},
+        )
+
     def _tool_search_web(self, args: dict[str, Any], context: ToolContext) -> dict[str, Any]:
         query = str(args.get("query") or context.state.get("query") or "").strip()
         results = self.web_research_service.search_service.search(
@@ -575,14 +675,22 @@ class AutonomousChatAgentService:
                 top_k=int(args.get("top_k") or 3),
             )
         )
-        for event in result.trace:
-            context.record_event(
-                event="WebResearchStep",
-                status=str(event.get("status") or "done"),
-                step=str(event.get("step") or "web_research"),
-                tool="verify_web_evidence",
-                output=dict(event.get("outputs_summary") or {}),
-            )
+        self._record_subagent_run(
+            context=context,
+            subagent_name="WebResearchService",
+            wrapper_tool="verify_web_evidence",
+            trace=list(result.trace),
+            input_summary={
+                "query": query,
+                "planned_queries": list(args.get("planned_queries") or []),
+                "top_k": int(args.get("top_k") or 3),
+            },
+            output_summary={
+                "citation_count": len(result.evidence),
+                "insufficient_evidence": bool(result.insufficient_evidence),
+            },
+            event_name="WebResearchStep",
+        )
         payload = result.as_dict()
         context.state["web_evidence"] = payload["evidence"]
         context.state["web_trace"] = payload["trace"]
@@ -716,12 +824,17 @@ class AutonomousChatAgentService:
     ) -> dict[str, Any]:
         session_id = UUID(str(context.state["session_id"]))
         user_id = UUID(str(context.state["user_id"]))
-        try:
-            memory_context = self.policy_service.session_service.get_memory_context(
-                session_id=session_id,
-                user_id=user_id,
-            )
-        except Exception:
+        side_query_memory = dict(context.state.get("memory_side_query") or {})
+        if side_query_memory:
+            memory_context = {
+                "side_query_memory_text": str(
+                    side_query_memory.get("memory_text") or ""
+                ),
+                "side_query_selected_names": list(
+                    side_query_memory.get("selected_names") or []
+                ),
+            }
+        else:
             memory_context = None
         try:
             attachments = self.policy_service._load_session_attachments(
@@ -767,6 +880,14 @@ class AutonomousChatAgentService:
     ) -> dict[str, Any]:
         query = str(args.get("query") or context.state.get("query") or "")
         top_k = int(args.get("top_k") or context.state.get("top_k") or 5)
+        context.record_event(
+            event="SubAgentStart",
+            status="running",
+            step="search_positions_pg",
+            tool="PositionDecisionAgent",
+            detail="PositionDecisionAgent started from search_positions_pg.",
+            input={"query": query, "top_k": top_k},
+        )
         result = self.position_agent.run(
             query=query,
             user_id=UUID(str(context.state["user_id"])),
@@ -783,6 +904,18 @@ class AutonomousChatAgentService:
         context.state["need_more_info"] = bool(result.get("need_more_info", False))
         context.state["missing_fields"] = list(result.get("missing_fields") or [])
         context.state["intent"] = "position_recommendation"
+        self._record_subagent_run(
+            context=context,
+            subagent_name="PositionDecisionAgent",
+            wrapper_tool="search_positions_pg",
+            trace=list(result.get("retrieval_trace") or []),
+            input_summary={"query": query, "top_k": top_k},
+            output_summary={
+                "recommendation_count": len(context.state["recommendations"]),
+                "need_more_info": context.state["need_more_info"],
+                "missing_fields": context.state["missing_fields"],
+            },
+        )
         return {
             "recommendations": context.state["recommendations"],
             "summary": context.state["recommendation_summary"],
@@ -796,11 +929,33 @@ class AutonomousChatAgentService:
         context: ToolContext,
     ) -> dict[str, Any]:
         recommendations = list(context.state.get("recommendations") or [])
+        context.record_event(
+            event="SubAgentStart",
+            status="running",
+            step="review_position_risks",
+            tool="RiskReviewAgent",
+            detail="RiskReviewAgent started from review_position_risks.",
+            input={
+                "query": str(args.get("query") or context.state.get("query") or ""),
+                "recommendation_count": len(recommendations),
+            },
+        )
         result = self.risk_review_agent.run(
             query=str(args.get("query") or context.state.get("query") or ""),
             recommendations=recommendations,
         )
         context.state["risk_review"] = dict(result)
+        self._record_subagent_run(
+            context=context,
+            subagent_name="RiskReviewAgent",
+            wrapper_tool="review_position_risks",
+            trace=list(result.get("trace") or []),
+            input_summary={"recommendation_count": len(recommendations)},
+            output_summary={
+                "risk_item_count": len(list(result.get("risk_items") or [])),
+                "risk_level": result.get("risk_level"),
+            },
+        )
         return dict(result)
 
     def _tool_generate_study_plan(
@@ -811,6 +966,17 @@ class AutonomousChatAgentService:
         profile = dict(context.state.get("user_profile") or {})
         recommendations = list(context.state.get("recommendations") or [])
         hours = int(args.get("study_hours_per_day") or profile.get("daily_study_hours") or 4)
+        context.record_event(
+            event="SubAgentStart",
+            status="running",
+            step="generate_study_plan",
+            tool="StudyPlanAgent",
+            detail="StudyPlanAgent started from generate_study_plan.",
+            input={
+                "recommendation_count": len(recommendations),
+                "study_hours_per_day": hours,
+            },
+        )
         result = self.study_plan_agent.run(
             user_profile=profile,
             recommendations=recommendations,
@@ -820,6 +986,20 @@ class AutonomousChatAgentService:
         )
         context.state["study_plan"] = dict(result)
         context.state["study_plan_markdown"] = str(result.get("plan_markdown") or "")
+        self._record_subagent_run(
+            context=context,
+            subagent_name="StudyPlanAgent",
+            wrapper_tool="generate_study_plan",
+            trace=list(result.get("trace") or []),
+            input_summary={
+                "recommendation_count": len(recommendations),
+                "study_hours_per_day": hours,
+            },
+            output_summary={
+                "plan_title": result.get("plan_title"),
+                "total_weeks": result.get("total_weeks"),
+            },
+        )
         return {
             "plan_title": result.get("plan_title"),
             "total_weeks": result.get("total_weeks"),
@@ -832,6 +1012,14 @@ class AutonomousChatAgentService:
         context: ToolContext,
     ) -> dict[str, Any]:
         title = str(args.get("title") or "岗位推荐与复习规划报告")
+        context.record_event(
+            event="SubAgentStart",
+            status="running",
+            step="compose_final_report",
+            tool="ReportGeneratorAgent",
+            detail="ReportGeneratorAgent started from compose_final_report.",
+            input={"title": title},
+        )
         result = self.report_generator_agent.run(
             title=title,
             recommendations=list(context.state.get("recommendations") or []),
@@ -842,6 +1030,14 @@ class AutonomousChatAgentService:
         if study_markdown:
             report = f"{report.rstrip()}\n\n## 复习规划\n\n{study_markdown}".strip()
         context.state["report"] = report
+        self._record_subagent_run(
+            context=context,
+            subagent_name="ReportGeneratorAgent",
+            wrapper_tool="compose_final_report",
+            trace=list(result.get("trace") or []),
+            input_summary={"title": title},
+            output_summary={"report_length": len(report)},
+        )
         return {"report": report, "report_meta": dict(result.get("report_meta") or {})}
 
     def _citation_preview(self, item: dict[str, Any]) -> dict[str, Any]:

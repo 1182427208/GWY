@@ -85,6 +85,14 @@ class Settings(BaseSettings):
     EMBEDDING_DIM: int = 1024
     REDIS_URL: str | None = None
     RAG_CACHE_TTL_SECONDS: int = 3600
+    MEMORY_SIDE_QUERY_ENABLED: bool = True
+    MEMORY_SIDE_QUERY_MODEL: str | None = None
+    MEMORY_SIDE_QUERY_MAX_CARDS: int = 200
+    MEMORY_SIDE_QUERY_MAX_SELECTED: int = 5
+    MEMORY_SIDE_QUERY_MAX_ITEM_CHARS: int = 4096
+    MEMORY_SIDE_QUERY_MAX_CONTEXT_CHARS: int = 60_000
+    MEMORY_SIDE_QUERY_MAX_CATALOG_CHARS: int = 60_000
+    MEMORY_SIDE_QUERY_TIMEOUT_SECONDS: float = 3.0
     # Short-term chat memory window measured in turns; override via env when needed.
     RAG_MEMORY_TURNS: int = 12
     # Working-memory summary should stay concise and focused on the latest dialogue state.
@@ -98,6 +106,8 @@ class Settings(BaseSettings):
     SEARXNG_TIMEOUT_SECONDS: float = 8.0
     SEARXNG_TOP_K: int = 5
     SEARXNG_LANGUAGE: str = "zh-CN"
+    WEB_MCP_URL: AnyUrl | None = None
+    DB_MCP_URL: AnyUrl | None = None
     FETCH_MCP_URL: AnyUrl | None = None
     PLAYWRIGHT_MCP_URL: AnyUrl | None = None
     WEB_FETCH_TIMEOUT_SECONDS: float = 10.0
@@ -105,6 +115,13 @@ class Settings(BaseSettings):
     LLM_API_KEY: str | None = None
     LLM_BASE_URL: str | None = None
     LLM_MODEL: str | None = None
+    CHAT_API_KEY: str | None = None
+    CHAT_BASE_URL: str | None = "https://a6api.com/v1"
+    CHAT_MODEL: str | None = "gpt-5.4-mini"
+    TOOL_CHAT_API_KEY: str | None = None
+    TOOL_CHAT_BASE_URL: str | None = None
+    TOOL_CHAT_MODEL: str | None = "gpt-5.4-mini"
+    FALLBACK_MODEL_ID: str | None = None
     FEISHU_WEBHOOK_URL: AnyUrl | None = None
 
     @computed_field  # type: ignore[prop-decorator]
@@ -164,7 +181,8 @@ class Settings(BaseSettings):
             self.LLM_BASE_URL = self.SILICONFLOW_BASE_URL
         if not self.LLM_MODEL and self.SILICONFLOW_CHAT_MODEL:
             self.LLM_MODEL = self.SILICONFLOW_CHAT_MODEL
-
+        if not self.CHAT_API_KEY and self.LLM_API_KEY:
+            self.CHAT_API_KEY = self.LLM_API_KEY
         self._check_default_secret("SECRET_KEY", self.SECRET_KEY)
         self._check_default_secret("POSTGRES_PASSWORD", self.POSTGRES_PASSWORD)
         self._check_default_secret(

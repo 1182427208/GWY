@@ -19,6 +19,24 @@ from app.gwy.models import (
 from app.gwy.services.chat_session_service import ChatSessionService
 
 
+def test_chat_request_base_accepts_position_snapshot_context() -> None:
+    payload = gwy_routes.ChatRequestBase.model_validate(
+        {
+            "query": "推荐岗位",
+            "snapshot": {"title": "固定快照", "selected_position_ids": ["p1"]},
+            "position_analysis_task_id": "00000000-0000-0000-0000-000000000001",
+        }
+    )
+
+    assert payload.snapshot == {
+        "title": "固定快照",
+        "selected_position_ids": ["p1"],
+    }
+    assert str(payload.position_analysis_task_id) == (
+        "00000000-0000-0000-0000-000000000001"
+    )
+
+
 class FakePolicyRagService:
     def __init__(self, session: Session | None = None, **_: object) -> None:
         self.session = session

@@ -3,16 +3,15 @@ from __future__ import annotations
 import json
 import logging
 import re
-import time
 import tempfile
+import time
+from collections.abc import Iterator
 from datetime import datetime
 from pathlib import Path
-from collections.abc import Iterator
 from queue import Empty, Queue
 from threading import Thread
-from uuid import uuid4
 from typing import Any, Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, File, HTTPException, UploadFile, status
 from fastapi.responses import Response, StreamingResponse
@@ -21,35 +20,34 @@ from sqlmodel import Session, select
 
 from app.api.deps import CurrentUser, SessionDep
 from app.core.db import engine
-from app.gwy.llm.embedding_service import EmbeddingService
 from app.gwy.agents.feishu_push_agent import FeishuPushAgent
-from app.gwy.llm.rerank_service import RerankService
+from app.gwy.document.pdf_loader import load_pdf_pages
+from app.gwy.evals.service import record_online_evaluation
+from app.gwy.llm.embedding_service import EmbeddingService
 from app.gwy.llm.multimodal_service import MultimodalSummaryService
+from app.gwy.llm.rerank_service import RerankService
 from app.gwy.llm.siliconflow_client import SiliconFlowClient
 from app.gwy.models import (
     GwyChatAttachment,
     GwyChatMessage,
     GwyChatSession,
-    GwyRecommendationItem,
     GwyUserProfile,
 )
 from app.gwy.prompts.policy_rag import (
     DIRECT_ANSWER_SYSTEM_PROMPT,
     POLICY_RAG_SYSTEM_PROMPT,
 )
+from app.gwy.services.autonomous_chat_agent_service import AutonomousChatAgentService
+from app.gwy.services.chat_session_service import ChatSessionService
+from app.gwy.services.chunk_debug_service import ChunkDebugService
+from app.gwy.services.long_term_memory_service import LongTermMemoryService
+from app.gwy.services.policy_ingestion_service import PolicyIngestionService
+from app.gwy.services.policy_rag_service import PolicyRagService
 from app.gwy.services.position_catalog_service import (
     PositionCatalogService,
     PositionListFilters,
 )
-from app.gwy.services.chunk_debug_service import ChunkDebugService
-from app.gwy.services.chat_session_service import ChatSessionService
-from app.gwy.services.agent_memory_service import AgentMemoryService
-from app.gwy.services.long_term_memory_service import LongTermMemoryService
 from app.gwy.services.study_plan_service import StudyPlanService
-from app.gwy.document.pdf_loader import load_pdf_pages
-from app.gwy.services.policy_ingestion_service import PolicyIngestionService
-from app.gwy.services.policy_rag_service import PolicyRagService
-from app.gwy.services.autonomous_chat_agent_service import AutonomousChatAgentService
 from app.gwy.vectorstores.milvus_store import MilvusPolicyStore
 from app.models import Message
 
@@ -222,6 +220,7 @@ class PositionAnalyzeRequest(BaseModel):
     query: str = ""
     top_k: int = Field(default=10, ge=1, le=20)
     position_profile: PositionRecommendationProfile | None = None
+    enable_evaluation: bool = False
 
 
 class PositionAnalyzeRecord(BaseModel):
@@ -265,6 +264,7 @@ class PositionAnalyzeResponse(BaseModel):
     recommendations: list[dict[str, Any]] = Field(default_factory=list)
     selected_positions: list[PositionAnalyzeRecord] = Field(default_factory=list)
     retrieval_trace: list[dict[str, Any]] = Field(default_factory=list)
+    evaluation_run_id: UUID | None = None
 
 
 class PositionPageSheetState(BaseModel):
@@ -304,6 +304,7 @@ class PolicyQueryRequest(BaseModel):
     mode: Literal["policy_rag", "position_recommendation", "autonomous_agent"] | None = None
     intent_hint: str | None = None
     position_profile: PositionRecommendationProfile | None = None
+    enable_evaluation: bool = False
     snapshot: dict[str, Any] | None = None
     position_analysis_task_id: UUID | None = None
 
@@ -319,6 +320,9 @@ class ChatRequestBase(BaseModel):
     mode: Literal["policy_rag", "position_recommendation", "autonomous_agent"] | None = None
     intent_hint: str | None = None
     position_profile: PositionRecommendationProfile | None = None
+    snapshot: dict[str, Any] | None = None
+    position_analysis_task_id: UUID | None = None
+    enable_evaluation: bool = False
 
 
 class ChatSessionCreateRequest(BaseModel):
@@ -400,6 +404,7 @@ class PolicyQueryResponse(BaseModel):
     session: ChatSessionResponse | None = None
     user_message: ChatMessageResponse | None = None
     assistant_message: ChatMessageResponse | None = None
+    evaluation_run_id: UUID | None = None
 
 
 class ChunkDebugRecord(BaseModel):
@@ -648,7 +653,23 @@ def analyze_positions(
         ),
         top_k=payload.top_k,
     )
-    return PositionAnalyzeResponse.model_validate(result)
+    response = PositionAnalyzeResponse.model_validate(result)
+    if payload.enable_evaluation:
+        evaluation = record_online_evaluation(
+            session=session,
+            user_id=current_user.id,
+            source_type="position",
+            source_id=None,
+            query=payload.query,
+            output=result,
+            profile=(
+                payload.position_profile.model_dump(exclude_none=True)
+                if payload.position_profile is not None
+                else {}
+            ),
+        )
+        response.evaluation_run_id = UUID(str(evaluation["id"]))
+    return response
 
 
 @router.get("/positions/page-state", response_model=PositionPageState)
@@ -927,7 +948,23 @@ def create_chat_message(
             else None
         ),
     )
-    return PolicyQueryResponse.model_validate(result)
+    response = PolicyQueryResponse.model_validate(result)
+    if payload.enable_evaluation:
+        evaluation = record_online_evaluation(
+            session=session,
+            user_id=current_user.id,
+            source_type="chat",
+            source_id=str(session_id),
+            query=payload.query,
+            output=result,
+            profile=(
+                payload.position_profile.model_dump(exclude_none=True)
+                if payload.position_profile is not None
+                else {}
+            ),
+        )
+        response.evaluation_run_id = UUID(str(evaluation["id"]))
+    return response
 
 
 @router.post("/chat/sessions/{session_id}/messages/stream")
@@ -1075,6 +1112,16 @@ def create_chat_message_stream(
                     user_message=service._serialize_message(user_message),
                     result=result,
                 )
+                if payload.enable_evaluation:
+                    evaluation = record_online_evaluation(
+                        session=session,
+                        user_id=current_user.id,
+                        source_type="chat",
+                        source_id=str(session_id),
+                        query=payload.query,
+                        output=result,
+                    )
+                    payload_data["evaluation_run_id"] = str(evaluation["id"])
                 yield _sse_stage_event(
                     "finalize",
                     "done",
@@ -1371,6 +1418,16 @@ def create_chat_message_stream(
                 user_message=service._serialize_message(user_message),
                 result=result,
             )
+            if payload.enable_evaluation:
+                evaluation = record_online_evaluation(
+                    session=session,
+                    user_id=current_user.id,
+                    source_type="chat",
+                    source_id=str(session_id),
+                    query=payload.query,
+                    output=result,
+                )
+                payload_data["evaluation_run_id"] = str(evaluation["id"])
             reasoning_content = "".join(reasoning_parts).strip()
             if reasoning_content:
                 assistant_message = payload_data.get("assistant_message")
@@ -1520,6 +1577,15 @@ async def upload_chat_attachments(
             except Exception:
                 extracted_text = ""
                 summary = "已上传 PDF 附件，当前仅保存文件，暂未完成文本提取。"
+                extraction_status = "pending_text_extraction"
+        elif attachment_type == "text":
+            try:
+                extracted_text = file_bytes.decode("utf-8", errors="replace").strip()
+                summary = _summarize_text(extracted_text)
+                extraction_status = "text_extracted"
+            except Exception:
+                extracted_text = ""
+                summary = "已上传文本附件，但暂未完成文本提取。"
                 extraction_status = "pending_text_extraction"
         else:
             summary = "已上传附件，等待后续处理。"
@@ -1988,6 +2054,7 @@ def generate_study_plan(
     recommendations: list[dict[str, Any]] = []
     if body.task_id:
         from sqlmodel import select as _sel
+
         from app.gwy.models import GwyRecommendationItem
         recs = session.exec(
             _sel(GwyRecommendationItem).where(
@@ -2065,6 +2132,18 @@ def _attachment_type_for_file(*, suffix: str, mime_type: str) -> str:
         return "image"
     if mime_type == "application/pdf" or suffix.lower() == ".pdf":
         return "pdf"
+    if mime_type.startswith("text/") or suffix.lower() in {
+        ".txt",
+        ".md",
+        ".markdown",
+        ".csv",
+        ".json",
+        ".log",
+        ".xml",
+        ".html",
+        ".htm",
+    }:
+        return "text"
     return "other"
 
 

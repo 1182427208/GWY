@@ -20,7 +20,11 @@ test("analysis page renders the report shell", async ({ page }) => {
               selected_count: 1,
               web_search_enabled: true,
             },
-            priority_sources: ["postgres_history", "milvus_policy", "web_search"],
+            priority_sources: [
+              "postgres_history",
+              "milvus_policy",
+              "web_search",
+            ],
             summary_lines: [
               "strategy: explore_then_verify",
               "planning: plan_and_solve",
@@ -118,15 +122,19 @@ test("analysis page renders the report shell", async ({ page }) => {
 
   await expect(page.getByText("load_snapshot")).toBeVisible()
   await expect(
-    page.getByText("\u5317\u4eac\u5c97\u4f4d\u5206\u6790\u5feb\u7167", {
-      exact: true,
-    }).first(),
+    page
+      .getByText("\u5317\u4eac\u5c97\u4f4d\u5206\u6790\u5feb\u7167", {
+        exact: true,
+      })
+      .first(),
   ).toBeVisible()
   await expect(page.getByText("Agent \u7b56\u7565\u5730\u56fe")).toBeVisible()
   await expect(
     page.getByText("explore_then_verify", { exact: true }).first(),
   ).toBeVisible()
-  await expect(page.getByText("plan_and_solve", { exact: true }).first()).toBeVisible()
+  await expect(
+    page.getByText("plan_and_solve", { exact: true }).first(),
+  ).toBeVisible()
   await expect(
     page.getByText("research_positions", { exact: true }).first(),
   ).toBeVisible()
@@ -234,14 +242,20 @@ test("analysis page renders the study plan section", async ({ page }) => {
 
   await page.goto("/gwy/analysis?task_id=task-2")
 
-  await expect(page.getByText("\u590d\u4e60\u89c4\u5212", { exact: true })).toBeVisible()
   await expect(
-    page.getByText("2026 \u5e74\u590d\u4e60\u89c4\u5212", { exact: true }).first(),
+    page.getByText("\u590d\u4e60\u89c4\u5212", { exact: true }),
+  ).toBeVisible()
+  await expect(
+    page
+      .getByText("2026 \u5e74\u590d\u4e60\u89c4\u5212", { exact: true })
+      .first(),
   ).toBeVisible()
   await expect(
     page.getByText("\u57fa\u7840\u9636\u6bb5", { exact: true }).first(),
   ).toBeVisible()
-  await expect(page.getByText("\u884c\u6d4b", { exact: true }).first()).toBeVisible()
+  await expect(
+    page.getByText("\u884c\u6d4b", { exact: true }).first(),
+  ).toBeVisible()
   await expect(
     page.getByText("\u57fa\u7840\u7ec3\u4e60", { exact: true }).first(),
   ).toBeVisible()

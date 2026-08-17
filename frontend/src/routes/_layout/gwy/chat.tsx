@@ -10,13 +10,11 @@ import {
   Plus,
   RefreshCw,
   Send,
-  ShieldAlert,
   Sparkles,
   Trash2,
   Upload,
   Volume2,
   VolumeX,
-  Workflow,
 } from "lucide-react"
 import {
   type ChangeEvent,
@@ -31,6 +29,7 @@ import {
 
 import { OpenAPI } from "@/client"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import useAuth from "@/hooks/useAuth"
 import { cn } from "@/lib/utils"
@@ -120,14 +119,15 @@ type AgentRiskReview = {
   trace?: Record<string, unknown>[]
 }
 
-type AgentMilestone = {
-  key: string
-  label: string
-  detail: string
-  tone: "neutral" | "success" | "warning"
+type AgentTodo = {
+  content: string
+  status: "pending" | "in_progress" | "completed"
 }
 
-type ChatRequestMode = "policy_rag" | "position_recommendation"
+type ChatRequestMode =
+  | "policy_rag"
+  | "position_recommendation"
+  | "autonomous_agent"
 
 type ChatQueryResponse = {
   answer: string
@@ -320,6 +320,7 @@ function GwyChatPage() {
   const [knowledgeBase, setKnowledgeBase] = useState("")
   const [topK, setTopK] = useState(6)
   const [useRerank, setUseRerank] = useState(true)
+  const [evaluationEnabled, setEvaluationEnabled] = useState(false)
   const [voiceInputSupported, setVoiceInputSupported] = useState(false)
   const [isListening, setIsListening] = useState(false)
   const [autoSpeak, setAutoSpeak] = useState(true)
@@ -431,6 +432,9 @@ function GwyChatPage() {
       onDelta: (delta: string) => void,
       onReasoning: (delta: string) => void,
       onStage: (stage: StreamStage) => void,
+      onTrace?: (trace: Record<string, unknown>) => void,
+      onSources?: (citations: ChatCitation[]) => void,
+      onReport?: (report: string) => void,
     ): Promise<ChatQueryResponse> => {
       let lastStage = "init"
       try {
@@ -488,6 +492,21 @@ function GwyChatPage() {
               if (stage) {
                 lastStage = stage.step
                 onStage(stage)
+              }
+            } else if (event?.event === "trace") {
+              const trace = extractTrace(event.data)
+              if (trace && onTrace) {
+                onTrace(trace)
+              }
+            } else if (event?.event === "sources") {
+              const citations = extractCitations(event.data)
+              if (citations.length > 0 && onSources) {
+                onSources(citations)
+              }
+            } else if (event?.event === "report") {
+              const report = extractReport(event.data)
+              if (report && onReport) {
+                onReport(report)
               }
             } else if (event?.event === "done") {
               finalPayload = event.data as ChatQueryResponse
@@ -878,6 +897,7 @@ function GwyChatPage() {
         mode: options.mode || null,
         intent_hint: options.intentHint || null,
         position_profile: options.positionProfile || null,
+        enable_evaluation: evaluationEnabled,
       }
 
       try {
@@ -894,6 +914,29 @@ function GwyChatPage() {
             updateStreamingAssistant(assistantMessageId, (message) =>
               mergeStageIntoMessage(message, stage),
             )
+          },
+          (trace) => {
+            updateStreamingAssistant(assistantMessageId, (message) => ({
+              ...message,
+              retrieval_trace: [...message.retrieval_trace, trace],
+            }))
+          },
+          (citations) => {
+            updateStreamingAssistant(assistantMessageId, (message) => ({
+              ...message,
+              citations,
+            }))
+          },
+          (report) => {
+            updateStreamingAssistant(assistantMessageId, (message) => ({
+              ...message,
+              metadata_json: {
+                ...(isRecord(message.metadata_json)
+                  ? message.metadata_json
+                  : {}),
+                report,
+              },
+            }))
           },
         )
         flushStreamBuffer(assistantMessageId)
@@ -915,6 +958,7 @@ function GwyChatPage() {
       updateStreamingAssistant,
       useRerank,
       year,
+      evaluationEnabled,
     ],
   )
 
@@ -1005,7 +1049,7 @@ function GwyChatPage() {
     stopAudioPlayback()
     setSending(true)
     try {
-      await submitQuery(query)
+      await submitQuery(query, { mode: "autonomous_agent" })
     } finally {
       setSending(false)
     }
@@ -1808,6 +1852,15 @@ function GwyChatPage() {
 
               <div className="mt-3 flex items-center justify-between gap-3">
                 <div className="flex flex-wrap items-center gap-2">
+                  <label className="inline-flex items-center gap-2 rounded-full border border-amber-200 bg-amber-50 px-2 py-1 text-[11px] text-amber-800">
+                    <Checkbox
+                      checked={evaluationEnabled}
+                      onCheckedChange={(checked) =>
+                        setEvaluationEnabled(checked === true)
+                      }
+                    />
+                    评测分析
+                  </label>
                   <span className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-600">
                     {knowledgeBaseLabel}
                   </span>
@@ -1860,23 +1913,17 @@ function ChatMessageBubble({
   const isUser = message.role === "user"
   const reasoningContent = getReasoningContent(message.metadata_json)
   const streamState = getStreamState(message.metadata_json)
-  const riskReview = getRiskReview(message.metadata_json)
-  const reportText = getReportText(message.metadata_json)
-  const agentMilestones = buildAgentMilestones(message.retrieval_trace).filter(
-    (milestone) => milestone.key !== "position_recommendation",
-  )
+  const isStreamingMessage =
+    !isUser &&
+    isRecord(message.metadata_json) &&
+    message.metadata_json.streaming === true
   const streamElapsedLabel = getStreamElapsedLabel(message, streamState)
   const canShowStreamDetails = !isUser && Boolean(streamState?.stages.length)
+  const canShowHarnessTimeline =
+    !isUser && (message.retrieval_trace.length > 0 || isStreamingMessage)
+  const shouldOpenHarness =
+    isStreamingMessage && message.content.trim().length === 0
   const canShowReasoning = !isUser && reasoningContent.trim().length > 0
-  const hasRiskReviewContent =
-    Boolean(riskReview?.need_manual_confirm) ||
-    Boolean(riskReview?.risk_level) ||
-    (riskReview?.risk_items?.length ?? 0) > 0
-  const canShowAgentPanel =
-    !isUser &&
-    (hasRiskReviewContent ||
-      reportText.trim().length > 0 ||
-      agentMilestones.length > 0)
 
   if (isUser) {
     return (
@@ -1937,15 +1984,6 @@ function ChatMessageBubble({
         <div className="whitespace-pre-wrap break-words text-[15px] leading-8 text-slate-900">
           {message.content}
         </div>
-
-        {canShowAgentPanel ? (
-          <AgentExecutionPanel
-            messageId={message.id}
-            riskReview={riskReview}
-            reportText={reportText}
-            milestones={agentMilestones}
-          />
-        ) : null}
 
         {canShowReasoning ? (
           <details className="group mt-3 w-full max-w-full text-left">
@@ -2011,18 +2049,16 @@ function ChatMessageBubble({
                   </div>
                 ))}
               </div>
-              {message.retrieval_trace.length > 0 ? (
-                <details className="mt-3 max-w-full">
-                  <summary className="cursor-pointer text-[11px] text-slate-500">
-                    检索轨迹
-                  </summary>
-                  <pre className="mt-2 max-h-56 max-w-full overflow-auto whitespace-pre-wrap border-l-2 border-slate-200 pl-3 text-[11px] leading-5 text-slate-500">
-                    {JSON.stringify(message.retrieval_trace, null, 2)}
-                  </pre>
-                </details>
-              ) : null}
             </div>
           </details>
+        ) : null}
+
+        {canShowHarnessTimeline ? (
+          <AgentHarnessTimeline
+            events={message.retrieval_trace}
+            messageId={message.id}
+            autoOpen={shouldOpenHarness}
+          />
         ) : null}
 
         {!isUser && message.citations.length > 0 ? (
@@ -2076,223 +2112,572 @@ function ChatMessageBubble({
             </div>
           </div>
         ) : null}
-
-        {!isUser && message.retrieval_trace.length > 0 ? (
-          <details className="mt-3 w-full max-w-full text-left text-xs text-slate-500">
-            <summary className="cursor-pointer select-none text-slate-500">
-              检索过程
-            </summary>
-            <pre className="mt-2 max-w-full overflow-auto whitespace-pre-wrap rounded-2xl border border-slate-200 bg-slate-50 p-3 text-[11px] leading-5 text-slate-500">
-              {JSON.stringify(message.retrieval_trace, null, 2)}
-            </pre>
-          </details>
-        ) : null}
       </div>
     </div>
   )
 }
 
-function AgentExecutionPanel({
+function AgentHarnessTimeline({
+  events,
   messageId,
-  riskReview,
-  reportText,
-  milestones,
+  autoOpen,
 }: {
+  events: Record<string, unknown>[]
   messageId: string
-  riskReview: AgentRiskReview | null
-  reportText: string
-  milestones: AgentMilestone[]
+  autoOpen?: boolean
 }) {
-  const riskItems = riskReview?.risk_items ?? []
-  const riskLevel = riskReview?.risk_level || "unknown"
-  const riskItemCount = riskItems.length
-  const needManualConfirm = Boolean(riskReview?.need_manual_confirm)
-  const reportPreview = buildReportPreview(reportText, 10)
-  const hasReport = reportText.trim().length > 0
+  const visibleEvents = events.filter((event) => isRecord(event))
+  const todos = getLatestTodos(visibleEvents)
+  const toolCount = visibleEvents.filter((event) =>
+    ["ToolUse", "PostToolUse", "PreToolUse"].includes(getTraceEventName(event)),
+  ).length
+  const permissionCount = visibleEvents.filter(
+    (event) => getTraceEventName(event) === "Permission",
+  ).length
+  const skillCount = visibleEvents.filter(
+    (event) => getTraceEventName(event) === "SkillLoaded",
+  ).length
 
   return (
-    <details className="relative mt-4 w-full overflow-hidden rounded-[28px] border border-slate-200 bg-gradient-to-br from-slate-950 via-slate-900 to-slate-800 text-white shadow-[0_20px_60px_rgba(15,23,42,0.18)]">
-      <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-4 sm:px-5 [&::-webkit-details-marker]:hidden">
+    <details
+      key={`${messageId}-${autoOpen ? "live" : "folded"}`}
+      open={autoOpen || undefined}
+      className="group mt-3 w-full max-w-full text-left"
+    >
+      <summary className="flex list-none items-center gap-2 text-xs text-slate-400 [&::-webkit-details-marker]:hidden">
         <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-white/10 px-3 py-1 text-[11px] font-medium uppercase tracking-[0.22em] text-cyan-100">
-              <Workflow className="h-3.5 w-3.5" />
-              实际链路
-            </span>
-            <span className="rounded-full bg-cyan-400/15 px-3 py-1 text-[11px] font-medium text-cyan-100">
-              检索
-            </span>
-            <span className="rounded-full bg-amber-400/15 px-3 py-1 text-[11px] font-medium text-amber-100">
-              风险审查
-            </span>
-            <span className="rounded-full bg-sky-400/15 px-3 py-1 text-[11px] font-medium text-sky-100">
-              报告生成
-            </span>
-          </div>
-          <h3 className="mt-3 text-base font-semibold tracking-tight text-white">
-            政策问答 Agent 链路
-          </h3>
-          <p className="mt-1 max-w-2xl text-sm leading-6 text-slate-300">
-            这里显示的是后端真实返回的检索轨迹、风险审查和报告内容。默认折叠，想看时再展开。
-          </p>
+          <span className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-white px-2.5 py-1 font-mono text-[11px] text-slate-600">
+            <Activity className="h-3.5 w-3.5 text-slate-400" />
+            {autoOpen
+              ? "Agent running"
+              : `${visibleEvents.length} hooks · ${toolCount} tools · ${permissionCount} gates · ${skillCount} skills`}
+          </span>
         </div>
-        <div className="shrink-0 text-xs text-slate-300">点击展开 / 收起</div>
+        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-slate-400 transition group-open:rotate-180" />
       </summary>
-
-      <div className="relative px-4 pb-4 sm:px-5">
-        <div className="pointer-events-none absolute -right-12 -top-12 size-40 rounded-full bg-cyan-400/15 blur-3xl" />
-        <div className="pointer-events-none absolute -bottom-16 left-1/3 size-48 rounded-full bg-sky-400/10 blur-3xl" />
-
-        <div className="mt-1 grid gap-3 sm:grid-cols-4">
-          <MetricChip
-            label="风险等级"
-            value={formatRiskLevelLabel(riskLevel)}
-          />
-          <MetricChip
-            label="风险项"
-            value={riskItemCount > 0 ? String(riskItemCount) : "0"}
-          />
-          <MetricChip
-            label="人工复核"
-            value={needManualConfirm ? "需要" : "可跳过"}
-          />
-          <MetricChip label="报告" value={hasReport ? "已生成" : "未生成"} />
-        </div>
-
-        <div className="mt-4 grid gap-3 lg:grid-cols-[1.2fr_0.8fr]">
-          <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
-            <div className="mb-3 flex items-center gap-2 text-[11px] uppercase tracking-[0.24em] text-slate-300">
-              <Activity className="h-3.5 w-3.5" />
-              执行轨迹
-            </div>
-            <div className="grid gap-2">
-              {milestones.length > 0 ? (
-                milestones.map((milestone) => (
-                  <div
-                    key={`${messageId}-${milestone.key}`}
-                    className="flex items-start gap-3 rounded-2xl border border-white/8 bg-slate-950/30 px-3 py-3"
-                  >
-                    <span
-                      className={cn(
-                        "mt-0.5 inline-flex size-6 shrink-0 items-center justify-center rounded-full text-[11px] font-semibold",
-                        milestone.tone === "success"
-                          ? "bg-emerald-400/15 text-emerald-200"
-                          : milestone.tone === "warning"
-                            ? "bg-amber-400/15 text-amber-100"
-                            : "bg-sky-400/15 text-sky-100",
-                      )}
-                    >
-                      {milestone.key.slice(0, 1).toUpperCase()}
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-sm font-medium text-white">
-                          {milestone.label}
-                        </span>
-                        <span className="rounded-full bg-white/10 px-2 py-0.5 text-[10px] text-slate-300">
-                          {milestone.key}
-                        </span>
-                      </div>
-                      <div className="mt-1 text-sm leading-6 text-slate-300">
-                        {milestone.detail}
-                      </div>
-                    </div>
-                  </div>
-                ))
-              ) : (
-                <div className="rounded-2xl border border-dashed border-white/10 bg-slate-950/20 px-3 py-4 text-sm text-slate-400">
-                  当前消息没有可展示的 Agent 轨迹。
-                </div>
-              )}
-            </div>
+      <div className="mt-2 max-h-[360px] overflow-auto border-l-2 border-slate-200 pl-3 font-mono">
+        {todos.length > 0 ? <HarnessTodoList todos={todos} /> : null}
+        {visibleEvents.length > 0 ? (
+          <div className="space-y-1.5">
+            {visibleEvents.map((event, index) => (
+              <HarnessLogLine
+                key={`${messageId}-harness-${getTraceId(event, index)}`}
+                event={event}
+                index={index}
+              />
+            ))}
           </div>
-
-          <div className="grid gap-3">
-            <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
-              <div className="mb-3 flex items-center gap-2 text-[11px] uppercase tracking-[0.24em] text-slate-300">
-                <ShieldAlert className="h-3.5 w-3.5" />
-                风险审查
-              </div>
-              {riskItems.length > 0 ? (
-                <div className="space-y-2">
-                  {riskItems.slice(0, 3).map((item, index) => (
-                    <div
-                      key={`${messageId}-risk-${index}`}
-                      className="rounded-2xl border border-white/8 bg-slate-950/30 px-3 py-3"
-                    >
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="text-sm font-medium text-white">
-                          {item.risk_type || `风险项 ${index + 1}`}
-                        </span>
-                        <span
-                          className={cn(
-                            "rounded-full px-2 py-0.5 text-[10px] font-medium",
-                            item.risk_level === "high"
-                              ? "bg-rose-400/15 text-rose-100"
-                              : item.risk_level === "medium"
-                                ? "bg-amber-400/15 text-amber-100"
-                                : "bg-emerald-400/15 text-emerald-100",
-                          )}
-                        >
-                          {formatRiskLevelLabel(item.risk_level)}
-                        </span>
-                      </div>
-                      <div className="mt-1 text-sm leading-6 text-slate-300">
-                        {item.explanation || item.evidence || "需要进一步核验"}
-                      </div>
-                      {item.suggestion ? (
-                        <div className="mt-2 rounded-2xl border border-white/8 bg-white/5 px-3 py-2 text-xs leading-5 text-slate-200">
-                          建议：{item.suggestion}
-                        </div>
-                      ) : null}
-                    </div>
-                  ))}
-                  {riskItems.length > 3 ? (
-                    <div className="text-xs text-slate-400">
-                      还有 {riskItems.length - 3} 项风险未展开。
-                    </div>
-                  ) : null}
-                </div>
-              ) : (
-                <div className="rounded-2xl border border-dashed border-white/10 bg-slate-950/20 px-3 py-4 text-sm text-slate-400">
-                  暂未识别到需要特别提示的风险。
-                </div>
-              )}
-            </div>
-
-            <div className="rounded-3xl border border-white/10 bg-white/5 p-4">
-              <div className="mb-3 flex items-center gap-2 text-[11px] uppercase tracking-[0.24em] text-slate-300">
-                <FileText className="h-3.5 w-3.5" />
-                报告预览
-              </div>
-              {hasReport ? (
-                <details className="group">
-                  <summary className="flex list-none cursor-pointer items-center justify-between gap-3 rounded-2xl border border-white/10 bg-slate-950/30 px-3 py-2 text-sm text-slate-200 [&::-webkit-details-marker]:hidden">
-                    <span className="truncate">查看生成报告</span>
-                    <ChevronDown className="h-4 w-4 shrink-0 transition group-open:rotate-180" />
-                  </summary>
-                  <div className="mt-3 rounded-2xl border border-white/10 bg-slate-950/30 p-3">
-                    <pre className="whitespace-pre-wrap break-words text-[12px] leading-6 text-slate-200">
-                      {reportPreview}
-                    </pre>
-                    {reportText.length > reportPreview.length ? (
-                      <div className="mt-2 text-[11px] text-slate-400">
-                        报告已截断显示，展开可在完整内容里查看。
-                      </div>
-                    ) : null}
-                  </div>
-                </details>
-              ) : (
-                <div className="rounded-2xl border border-dashed border-white/10 bg-slate-950/20 px-3 py-4 text-sm text-slate-400">
-                  当前没有报告内容。
-                </div>
-              )}
-            </div>
+        ) : (
+          <div className="px-2 py-2 text-xs text-slate-400">
+            正在等待第一条 Agent 运行日志...
           </div>
-        </div>
+        )}
       </div>
     </details>
   )
+}
+
+function HarnessTodoList({ todos }: { todos: AgentTodo[] }) {
+  return (
+    <div className="mb-3 px-2 py-2">
+      <div className="mb-2 text-[13px] font-bold text-slate-700">
+        ## Current Tasks
+      </div>
+      <div className="space-y-1">
+        {todos.map((todo, index) => (
+          <div
+            key={`${todo.content}-${index}`}
+            className="grid grid-cols-[24px_minmax(0,1fr)] gap-2 text-[13px] leading-5"
+          >
+            <span
+              className={cn(
+                "text-center font-bold",
+                todo.status === "completed"
+                  ? "text-emerald-600"
+                  : todo.status === "in_progress"
+                    ? "text-amber-600"
+                    : "text-slate-300",
+              )}
+            >
+              {formatTodoStatusIcon(todo.status)}
+            </span>
+            <span
+              className={cn(
+                "break-words",
+                todo.status === "completed"
+                  ? "text-slate-400 line-through decoration-slate-300"
+                  : "text-slate-700",
+              )}
+            >
+              {todo.content}
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function HarnessLogLine({
+  event,
+  index,
+}: {
+  event: Record<string, unknown>
+  index: number
+}) {
+  const status = getTraceStatus(event)
+  const display = getHookDisplay(event)
+  const label = display.label
+  const rawLabel = display.rawLabel
+  const detail = display.detail
+  const inputSummary = summarizeTracePayload(event.input)
+  const outputSummary = summarizeTracePayload(event.output)
+  const elapsed =
+    typeof event.elapsed_ms === "number"
+      ? formatElapsedMs(event.elapsed_ms)
+      : ""
+  const compactDetail = detail || outputSummary || inputSummary
+
+  return (
+    <div className="min-w-0 rounded-md px-2 py-1.5 text-[13px] leading-5 transition hover:bg-slate-50">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="shrink-0 font-bold text-slate-500">[HOOK]</span>
+        <span className="break-all font-semibold text-slate-800">{label}</span>
+        {rawLabel ? (
+          <span className="font-mono text-[11px] text-slate-400">
+            {rawLabel}
+          </span>
+        ) : null}
+        <span
+          className={cn(
+            "rounded px-1.5 py-0.5 text-[10px]",
+            getHookStatusClass(status),
+          )}
+        >
+          {formatTraceStatus(status)}
+        </span>
+        <span className="text-[11px] text-slate-300">#{index + 1}</span>
+        {elapsed ? (
+          <span className="text-[11px] text-slate-300">{elapsed}</span>
+        ) : null}
+      </div>
+      {compactDetail ? (
+        <div className="mt-1 break-words pl-[54px] text-[12px] text-slate-500">
+          {compactDetail}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function getHookDisplay(event: Record<string, unknown>): {
+  label: string
+  rawLabel: string
+  detail: string
+} {
+  const eventName = getTraceEventName(event)
+  const tool = typeof event.tool === "string" ? event.tool : ""
+  const step = typeof event.step === "string" ? event.step : ""
+  const status = getTraceStatus(event)
+  const rawLabel = tool || step || eventName
+  const outputSummary = summarizeTracePayload(event.output)
+  const errorDetail = status === "error" && outputSummary ? outputSummary : ""
+
+  if (eventName === "SubAgentStart") {
+    return {
+      label: "子 Agent 启动",
+      rawLabel,
+      detail:
+        getTraceDetail(event) ||
+        summarizeTracePayload(event.input) ||
+        "Agent 正在启动一个子任务执行器。",
+    }
+  }
+  if (eventName === "SubAgentEnd") {
+    return {
+      label: status === "error" ? "子 Agent 失败" : "子 Agent 完成",
+      rawLabel,
+      detail:
+        errorDetail ||
+        getTraceDetail(event) ||
+        summarizeTracePayload(event.output) ||
+        "子 Agent 已结束执行。",
+    }
+  }
+  if (eventName === "SubAgentToolUse") {
+    return {
+      label: "子 Agent 步骤",
+      rawLabel,
+      detail:
+        errorDetail ||
+        getTraceDetail(event) ||
+        summarizeTracePayload(event.output) ||
+        "子 Agent 正在执行内部步骤。",
+    }
+  }
+
+  const toolDisplay = getToolDisplay(tool || step)
+  if (toolDisplay) {
+    const phaseDetail = getStepDetail(step, status)
+    return {
+      label: toolDisplay.label,
+      rawLabel,
+      detail:
+        errorDetail ||
+        phaseDetail ||
+        getTraceDetail(event) ||
+        toolDisplay.detail,
+    }
+  }
+
+  const eventDisplay = getEventDisplay(eventName, step, status)
+  return {
+    label: eventDisplay.label,
+    rawLabel: rawLabel === eventDisplay.label ? "" : rawLabel,
+    detail: errorDetail || getTraceDetail(event) || eventDisplay.detail,
+  }
+}
+
+function getToolDisplay(
+  name: string,
+): { label: string; detail: string } | null {
+  const labels: Record<string, { label: string; detail: string }> = {
+    todo_write: {
+      label: "更新任务清单",
+      detail: "Agent 正在规划或更新当前要完成的步骤。",
+    },
+    load_skill: {
+      label: "加载技能说明",
+      detail: "Agent 正在读取某个技能的使用规则，用来指导后续工具调用。",
+    },
+    search_policy_knowledge: {
+      label: "检索政策知识库",
+      detail: "Agent 正在从向量库和关键词候选中查找可引用的政策依据。",
+    },
+    compose_policy_answer: {
+      label: "生成政策回答",
+      detail: "Agent 正在基于检索到的证据组织最终回答。",
+    },
+    search_positions_pg: {
+      label: "筛选岗位表",
+      detail: "Agent 正在用 PostgreSQL 的结构化字段筛选公务员岗位。",
+    },
+    review_position_risks: {
+      label: "审查岗位风险",
+      detail: "Agent 正在检查岗位条件、专业限制、地区和报考风险。",
+    },
+    generate_study_plan: {
+      label: "生成备考计划",
+      detail: "Agent 正在根据用户情况和目标岗位安排复习计划。",
+    },
+    compose_final_report: {
+      label: "整理最终报告",
+      detail: "Agent 正在把岗位、风险、依据和备考建议汇总成最终回答。",
+    },
+  }
+  return labels[name] || null
+}
+
+function getEventDisplay(
+  eventName: string,
+  step: string,
+  status: string,
+): { label: string; detail: string } {
+  if (eventName === "UserPromptSubmit") {
+    return {
+      label: "收到用户问题",
+      detail: "系统已接收你的问题，并开始进入 Agent 执行循环。",
+    }
+  }
+  if (eventName === "LLMStart") {
+    return {
+      label: "模型思考下一步",
+      detail: "模型正在判断是否需要列计划、调用工具、继续检索或直接回答。",
+    }
+  }
+  if (eventName === "LLMStop") {
+    return {
+      label: "模型返回决策",
+      detail: "模型已经决定本轮要做什么，可能是调用工具，也可能是输出回答。",
+    }
+  }
+  if (eventName === "PreToolUse") {
+    return {
+      label: "准备调用工具",
+      detail: "系统正在整理工具参数，并准备进入权限检查。",
+    }
+  }
+  if (eventName === "Permission") {
+    return {
+      label: "权限检查",
+      detail:
+        status === "allow"
+          ? "该工具是允许执行的项目内工具，已放行。"
+          : "系统正在判断这个工具调用是否允许执行。",
+    }
+  }
+  if (eventName === "ToolUse") {
+    return {
+      label: "执行工具",
+      detail: "工具已经开始运行，后续会返回执行结果。",
+    }
+  }
+  if (eventName === "PostToolUse") {
+    return {
+      label: status === "error" ? "工具执行失败" : "工具执行完成",
+      detail:
+        status === "error"
+          ? "工具执行时出现错误，Agent 会根据错误尝试恢复或换路径。"
+          : "工具已返回结果，Agent 会把结果交给模型继续判断。",
+    }
+  }
+  if (eventName === "RetrievalStep") {
+    return {
+      label: formatStepLabel(step),
+      detail: getStepDetail(step, status),
+    }
+  }
+  if (eventName === "Stop") {
+    return {
+      label: "Agent 停止",
+      detail: "本轮 Agent 已完成工具调用，准备输出最终回答。",
+    }
+  }
+  return {
+    label: formatTraceEventLabel(eventName),
+    detail: "Agent 正在处理这一内部步骤。",
+  }
+}
+
+function getStepDetail(step: string, status: string): string {
+  const verb =
+    status === "done" ? "已完成" : status === "error" ? "失败" : "正在"
+  const details: Record<string, string> = {
+    rewrite_queries:
+      status === "done"
+        ? "已把原问题改写成更适合知识库检索的查询。"
+        : `${verb}改写检索问题。`,
+    retrieve:
+      status === "done"
+        ? "已完成向量检索和关键词候选检索。"
+        : `${verb}检索向量库和关键词候选。`,
+    fuse_and_rerank:
+      status === "done"
+        ? "已完成候选证据融合和重排序。"
+        : `${verb}对检索结果做融合和重排序。`,
+    react_evidence_review:
+      status === "done"
+        ? "已检查证据是否足够支撑回答。"
+        : `${verb}检查证据是否足够。`,
+    agent_loop:
+      status === "done" ? "模型已完成本轮判断。" : "模型正在判断下一步行动。",
+  }
+  return details[step] || ""
+}
+
+function formatStepLabel(step: string): string {
+  const labels: Record<string, string> = {
+    rewrite_queries: "改写检索问题",
+    retrieve: "检索候选证据",
+    fuse_and_rerank: "证据融合排序",
+    react_evidence_review: "检查证据充分性",
+    agent_loop: "Agent 决策循环",
+  }
+  return labels[step] || step || "内部步骤"
+}
+
+function getTraceId(event: Record<string, unknown>, index: number): string {
+  return typeof event.id === "string" && event.id ? event.id : String(index)
+}
+
+function getLatestTodos(events: Record<string, unknown>[]): AgentTodo[] {
+  let latest: AgentTodo[] = []
+  for (const event of events) {
+    const tool = typeof event.tool === "string" ? event.tool : ""
+    const step = typeof event.step === "string" ? event.step : ""
+    if (
+      tool !== "todo_write" &&
+      tool !== "todo_tasks" &&
+      step !== "todo_write" &&
+      step !== "todo_tasks"
+    ) {
+      continue
+    }
+    const outputTodos = extractTodosFromPayload(event.output)
+    const inputTodos = extractTodosFromPayload(event.input)
+    const todos = outputTodos.length > 0 ? outputTodos : inputTodos
+    if (todos.length > 0) {
+      latest = todos
+    }
+  }
+  return latest
+}
+
+function extractTodosFromPayload(value: unknown): AgentTodo[] {
+  if (!isRecord(value)) {
+    if (!Array.isArray(value)) {
+      return []
+    }
+    return value
+      .map((item) => normalizeTodoItem(item))
+      .filter((item): item is AgentTodo => item !== null)
+  }
+
+  const directTodos = Array.isArray(value.todos) ? value.todos : null
+  const contractTodos =
+    isRecord(value.task_contract) && Array.isArray(value.task_contract.todos)
+      ? value.task_contract.todos
+      : null
+  const todos = directTodos ?? contractTodos
+  if (!todos) {
+    return []
+  }
+  return todos
+    .map((item) => {
+      return normalizeTodoItem(item)
+    })
+    .filter((item): item is AgentTodo => item !== null)
+}
+
+function normalizeTodoItem(value: unknown): AgentTodo | null {
+  if (!isRecord(value)) {
+    return null
+  }
+  const content =
+    typeof value.content === "string" ? value.content.trim() : ""
+  const status =
+    value.status === "completed" ||
+    value.status === "in_progress" ||
+    value.status === "pending"
+      ? value.status
+      : "pending"
+  if (!content) {
+    return null
+  }
+  return { content, status }
+}
+
+function formatTodoStatusIcon(status: AgentTodo["status"]): string {
+  if (status === "completed") {
+    return "✓"
+  }
+  if (status === "in_progress") {
+    return "▸"
+  }
+  return " "
+}
+
+function getHookStatusClass(status: string): string {
+  if (status === "error" || status === "deny" || status === "denied") {
+    return "bg-rose-50 text-rose-700"
+  }
+  if (status === "running") {
+    return "bg-amber-50 text-amber-700"
+  }
+  if (status === "allow" || status === "done") {
+    return "bg-emerald-50 text-emerald-700"
+  }
+  return "bg-slate-100 text-slate-600"
+}
+
+function getTraceEventName(event: Record<string, unknown>): string {
+  if (typeof event.event === "string" && event.event) {
+    return event.event
+  }
+  if (typeof event.step === "string" && event.step) {
+    return event.step
+  }
+  return "TraceEvent"
+}
+
+function getTraceStatus(event: Record<string, unknown>): string {
+  return typeof event.status === "string" && event.status
+    ? event.status
+    : typeof event.stage === "string" && event.stage
+      ? event.stage
+      : "done"
+}
+
+function getTraceDetail(event: Record<string, unknown>): string {
+  if (typeof event.detail === "string") {
+    return event.detail
+  }
+  if (typeof event.action === "string") {
+    return event.action
+  }
+  return ""
+}
+
+function formatTraceStatus(status: string): string {
+  const labels: Record<string, string> = {
+    running: "运行中",
+    done: "完成",
+    error: "失败",
+    allow: "允许",
+    deny: "拒绝",
+    denied: "已拦截",
+  }
+  return labels[status] || status
+}
+
+function formatTraceEventLabel(eventName: string): string {
+  const labels: Record<string, string> = {
+    UserPromptSubmit: "用户请求",
+    LLMStart: "模型思考",
+    LLMStop: "模型返回",
+    PreToolUse: "工具准备",
+    Permission: "权限门",
+    ToolUse: "工具调用",
+    PostToolUse: "工具结果",
+    SkillLoaded: "技能加载",
+    Compact: "上下文压缩",
+    Memory: "记忆事件",
+    Stop: "停止",
+    Fallback: "降级流程",
+  }
+  return labels[eventName] || eventName
+}
+
+function summarizeTracePayload(value: unknown): string {
+  if (!isRecord(value)) {
+    return ""
+  }
+  const errorText =
+    typeof value.error === "string" && value.error.trim()
+      ? value.error.trim()
+      : ""
+  const errorType =
+    typeof value.error_type === "string" && value.error_type.trim()
+      ? value.error_type.trim()
+      : ""
+  if (errorText || errorType) {
+    return [errorType, errorText].filter(Boolean).join(": ")
+  }
+  const entries = Object.entries(value).filter(([, item]) => item != null)
+  if (entries.length === 0) {
+    return ""
+  }
+  return entries
+    .slice(0, 6)
+    .map(([key, item]) => `${key}: ${summarizeTraceValue(item)}`)
+    .join(" · ")
+}
+
+function summarizeTraceValue(value: unknown): string {
+  if (typeof value === "string") {
+    return value.length > 140 ? `${value.slice(0, 140)}...` : value
+  }
+  if (typeof value === "number" || typeof value === "boolean") {
+    return String(value)
+  }
+  if (Array.isArray(value)) {
+    return `${value.length} 项`
+  }
+  if (isRecord(value)) {
+    const keys = Object.keys(value)
+    return keys.length ? `{${keys.slice(0, 4).join(", ")}}` : "{}"
+  }
+  return String(value)
 }
 
 function parseSseFrame(frame: string): SseEvent | null {
@@ -2331,6 +2716,37 @@ function extractDelta(data: unknown): string {
   }
   const payload = data as { delta?: unknown }
   return typeof payload.delta === "string" ? payload.delta : ""
+}
+
+function extractTrace(data: unknown): Record<string, unknown> | null {
+  if (!data || typeof data !== "object") {
+    return null
+  }
+  const payload = data as { trace?: unknown }
+  return payload.trace && typeof payload.trace === "object"
+    ? (payload.trace as Record<string, unknown>)
+    : null
+}
+
+function extractCitations(data: unknown): ChatCitation[] {
+  if (!data || typeof data !== "object") {
+    return []
+  }
+  const payload = data as { citations?: unknown }
+  if (!Array.isArray(payload.citations)) {
+    return []
+  }
+  return payload.citations.filter((item): item is ChatCitation =>
+    Boolean(item && typeof item === "object"),
+  )
+}
+
+function extractReport(data: unknown): string {
+  if (!data || typeof data !== "object") {
+    return ""
+  }
+  const payload = data as { report?: unknown }
+  return typeof payload.report === "string" ? payload.report : ""
 }
 
 function extractStage(data: unknown): StreamStage | null {
@@ -2479,161 +2895,6 @@ function getReasoningContent(metadata_json: Record<string, unknown>): string {
   return typeof value === "string" ? value : ""
 }
 
-function getRiskReview(
-  metadata_json: Record<string, unknown>,
-): AgentRiskReview | null {
-  const raw = metadata_json.risk_review
-  if (!isRecord(raw)) {
-    return null
-  }
-  return raw as AgentRiskReview
-}
-
-function getReportText(metadata_json: Record<string, unknown>): string {
-  const value = metadata_json.report
-  return typeof value === "string" ? value : ""
-}
-
-function buildAgentMilestones(
-  retrievalTrace: Record<string, unknown>[],
-): AgentMilestone[] {
-  const milestones: AgentMilestone[] = []
-  const seen = new Set<string>()
-  for (const entry of retrievalTrace) {
-    if (!isRecord(entry)) {
-      continue
-    }
-    const step = typeof entry.step === "string" ? entry.step : ""
-    if (!step || seen.has(step)) {
-      continue
-    }
-    const milestone = formatAgentMilestone(step, entry)
-    if (!milestone) {
-      continue
-    }
-    seen.add(step)
-    milestones.push(milestone)
-  }
-  return milestones
-}
-
-function formatAgentMilestone(
-  step: string,
-  entry: Record<string, unknown>,
-): AgentMilestone | null {
-  switch (step) {
-    case "position_recommendation":
-      return {
-        key: step,
-        label: "结构化分析",
-        detail:
-          typeof entry.stage === "string" && entry.stage === "done"
-            ? "已完成结构化条件分析。"
-            : "正在基于结构化条件做分析。",
-        tone: "success",
-      }
-    case "react_evidence_review":
-      return {
-        key: step,
-        label: "证据复核",
-        detail:
-          typeof entry.action === "string" && entry.action === "refine"
-            ? `补充了 ${formatCount(entry.extra_hit_count)} 条证据后重新校验。`
-            : "证据充足，跳过额外补证。",
-        tone: "neutral",
-      }
-    case "risk_intent_analysis":
-      return {
-        key: step,
-        label: "风险识别",
-        detail: `识别出 ${formatCount(entry.hypothesis_count)} 个风险假设。`,
-        tone: "warning",
-      }
-    case "risk_act":
-      return {
-        key: step,
-        label: "风险检索",
-        detail: `检索到 ${formatCount(entry.evidence_hit_count)} 条相关证据。`,
-        tone: "neutral",
-      }
-    case "risk_observe":
-      return {
-        key: step,
-        label: "风险归纳",
-        detail: `汇总形成 ${formatCount(entry.risk_item_count)} 项风险结论。`,
-        tone: "warning",
-      }
-    case "risk_reflect":
-      return {
-        key: step,
-        label: "风险定级",
-        detail: `当前综合风险等级为 ${formatRiskLevelLabel(
-          typeof entry.risk_level === "string" ? entry.risk_level : undefined,
-        )}。`,
-        tone: "warning",
-      }
-    case "plan":
-      return {
-        key: step,
-        label: "报告规划",
-        detail: `生成了 ${formatCount(entry.outline_count)} 个报告提纲项。`,
-        tone: "neutral",
-      }
-    case "solve":
-      return {
-        key: step,
-        label: "报告生成",
-        detail:
-          typeof entry.used_llm === "boolean" && entry.used_llm
-            ? "已生成并润色报告初稿。"
-            : "已完成报告初稿整理。",
-        tone: "success",
-      }
-    case "review":
-      return {
-        key: step,
-        label: "报告复核",
-        detail:
-          typeof entry.passed === "boolean" && entry.passed
-            ? "报告内容复核通过。"
-            : `发现 ${formatCount(entry.missing_section_count)} 处提纲缺失。`,
-        tone: "neutral",
-      }
-    default:
-      return null
-  }
-}
-
-function formatCount(value: unknown): string {
-  return typeof value === "number" && Number.isFinite(value)
-    ? String(value)
-    : "0"
-}
-
-function buildReportPreview(reportText: string, maxLines = 10): string {
-  const lines = reportText
-    .split(/\r?\n/)
-    .map((line) => line.trimEnd())
-    .filter((line) => line.length > 0 || line === "")
-  if (lines.length <= maxLines) {
-    return reportText.trim()
-  }
-  return `${lines.slice(0, maxLines).join("\n")}\n\n...`
-}
-
-function formatRiskLevelLabel(risk?: string | null): string {
-  if (!risk) {
-    return "未知"
-  }
-  const labels: Record<string, string> = {
-    low: "低风险",
-    medium: "中风险",
-    high: "高风险",
-    unknown: "未知",
-  }
-  return labels[risk] || risk
-}
-
 function getStreamElapsedLabel(
   message: ChatMessage,
   streamState: StreamState | null,
@@ -2683,17 +2944,6 @@ function formatIntentLabel(intent?: string | null): string {
   return labels[intent] || intent
 }
 
-function MetricChip({ label, value }: { label: string; value: string }) {
-  return (
-    <div className="rounded-2xl border border-white/10 bg-white/10 px-3 py-3 shadow-[0_8px_20px_rgba(15,23,42,0.12)]">
-      <div className="text-[10px] uppercase tracking-[0.2em] text-slate-300">
-        {label}
-      </div>
-      <div className="mt-2 text-sm font-semibold text-white">{value}</div>
-    </div>
-  )
-}
-
 function formatStreamStageLabel(stage: string): string {
   const labels: Record<string, string> = {
     init: "初始化",
@@ -2705,6 +2955,7 @@ function formatStreamStageLabel(stage: string): string {
     react_evidence_review: "证据复核",
     risk_review: "风险审查",
     report_generation: "报告生成",
+    autonomous_agent: "自主 Agent",
     direct_answer: "直接回答",
     answer: "答案生成",
     finalize: "会话收尾",

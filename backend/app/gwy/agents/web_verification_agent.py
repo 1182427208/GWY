@@ -42,7 +42,7 @@ class WebVerificationAgent:
             fetch_service=self.web_fetch_service,
             browser_service=self.browser_service,
         )
-        self.graph = self._build_graph()
+        self.graph = None
 
     def run(
         self,
@@ -62,8 +62,29 @@ class WebVerificationAgent:
             "planned_queries": list(planned_queries or []),
             "research_targets": list(research_targets or []),
             "trace": [],
+            "search_round": 0,
+            "search_retry_budget": 1,
         }
-        return self.graph.invoke(state)
+        return self._run_loop(state)
+
+    def _run_loop(self, state: WebVerificationState) -> dict[str, Any]:
+        current_state: dict[str, Any] = dict(state)
+        next_step: str | None = "plan"
+        safety = 0
+        while next_step and safety < 8:
+            safety += 1
+            step = next_step
+            next_step = None
+            if step == "plan":
+                current_state.update(self._node_plan(current_state))
+            elif step == "search":
+                current_state.update(self._node_search_shared(current_state))
+            elif step == "observe":
+                current_state.update(self._node_observe(current_state))
+            else:
+                break
+            next_step = self._decide_next_step(current_state, step)
+        return current_state
 
     def _build_graph(self) -> Any:
         builder = StateGraph(WebVerificationState)
@@ -75,6 +96,41 @@ class WebVerificationAgent:
         builder.add_edge("search", "observe")
         builder.add_edge("observe", END)
         return builder.compile()
+
+    def _decide_next_step(self, state: WebVerificationState, current_step: str) -> str | None:
+        if current_step == "plan":
+            return "search" if list(state.get("search_queries") or []) else "observe"
+        if current_step == "search":
+            attempts = list(state.get("web_search_attempts") or [])
+            results = list(state.get("web_results") or [])
+            if not results and int(state.get("search_retry_budget") or 0) > 0:
+                state["search_retry_budget"] = int(state.get("search_retry_budget") or 0) - 1
+                state["search_round"] = int(state.get("search_round") or 0) + 1
+                state["search_queries"] = self._refine_search_queries(
+                    queries=list(state.get("search_queries") or []),
+                    attempts=attempts,
+                    research_targets=list(state.get("research_targets") or []),
+                    position=dict(state.get("position") or {}),
+                    scope=dict(state.get("scope") or {}),
+                )
+                return "search"
+            return "observe"
+        if current_step == "observe":
+            attempts = list(state.get("web_search_attempts") or [])
+            results = list(state.get("web_results") or [])
+            if not results and int(state.get("search_retry_budget") or 0) > 0:
+                state["search_retry_budget"] = int(state.get("search_retry_budget") or 0) - 1
+                state["search_round"] = int(state.get("search_round") or 0) + 1
+                state["search_queries"] = self._refine_search_queries(
+                    queries=list(state.get("search_queries") or []),
+                    attempts=attempts,
+                    research_targets=list(state.get("research_targets") or []),
+                    position=dict(state.get("position") or {}),
+                    scope=dict(state.get("scope") or {}),
+                )
+                return "search"
+            return None
+        return None
 
     def _node_plan(self, state: WebVerificationState) -> dict[str, Any]:
         position = dict(state.get("position") or {})
@@ -109,6 +165,8 @@ class WebVerificationAgent:
         trace.append(
             {
                 "step": "web_verification_plan",
+                "agent": "WebVerificationAgent",
+                "skill": "web_query_planning",
                 "status": "done",
                 "detail": "先按缺失年份和字段拆分检索目标，再逐条检索对应证据。",
                 "query_count": len(queries),
@@ -131,6 +189,7 @@ class WebVerificationAgent:
                     "first_query": queries[0] if queries else "",
                     "target_count": len(research_targets),
                 },
+                "next_action": "search" if queries else "observe",
             }
         )
         return {"search_queries": queries, "trace": trace}
@@ -242,6 +301,9 @@ class WebVerificationAgent:
                 trace.append(
                     {
                         "step": "web_verification_search",
+                        "agent": "WebVerificationAgent",
+                        "tool": "WebSearchService.search / WebFetchService.fetch / PlaywrightMCPService.read",
+                        "backend": "SearXNG + HTTP fetch + Playwright MCP",
                         "status": "done" if attempt_results else "retry",
                         "detail": (
                             f"第 {query_index} 组检索词命中 {len(attempt_results)} 条结果；"
@@ -265,6 +327,7 @@ class WebVerificationAgent:
                             "fetched_count": fetched_count,
                             "browser_fallback_count": browser_fallback_count,
                         },
+                        "next_action": "search" if not attempt_results else "observe",
                         "evidence_refs": [
                             {
                                 "id": str(hit.get("url") or hit.get("final_url") or ""),
@@ -305,6 +368,8 @@ class WebVerificationAgent:
         trace.append(
             {
                 "step": "web_verification_observe",
+                "agent": "WebVerificationAgent",
+                "skill": "reflection",
                 "status": "done",
                 "detail": (
                     "整理外网补证结果，确认是否需要重试，并统计浏览器回填情况。"
@@ -320,6 +385,7 @@ class WebVerificationAgent:
                     "retry_count": retry_count,
                     "browser_fallback_count": browser_fallback_count,
                 },
+                "next_action": "search" if not results and retry_count == 0 else "done",
             }
         )
         return {
@@ -605,6 +671,41 @@ class WebVerificationAgent:
         if any(keyword in joined for keyword in ("招录人数", "招考人数", "录用人数")):
             return " 官方公告 招录人数"
         return " 官方公告 招考简章"
+
+    def _refine_search_queries(
+        self,
+        *,
+        queries: list[str],
+        attempts: list[dict[str, Any]],
+        research_targets: list[dict[str, Any]],
+        position: dict[str, Any],
+        scope: dict[str, Any],
+    ) -> list[str]:
+        refined: list[str] = []
+        for query in queries[:3]:
+            retry_query = self._build_web_retry_query(query)
+            if retry_query:
+                refined.append(retry_query)
+            else:
+                refined.append(query)
+        if not refined:
+            refined.extend(
+                self._build_web_search_queries(
+                    position=position,
+                    history_summary={"record_count": 0},
+                    scope=scope,
+                )
+            )
+        for target in research_targets[:2]:
+            for extra in list(target.get("retry_queries") or [])[:2]:
+                extra_query = str(extra or "").strip()
+                if extra_query:
+                    refined.append(extra_query)
+        if attempts:
+            last_query = str(attempts[-1].get("query") or "").strip()
+            if last_query:
+                refined.append(last_query)
+        return self._deduplicate_texts(refined)
 
     def _deduplicate_texts(self, values: list[str]) -> list[str]:
         deduplicated: list[str] = []

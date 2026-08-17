@@ -3,12 +3,20 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass, field
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict
 
-from langgraph.graph import END, START, StateGraph
+try:
+    from langgraph.graph import END, START, StateGraph
+    _HAS_LANGGRAPH = True
+except ModuleNotFoundError:  # pragma: no cover - optional dependency fallback
+    END = START = None
+    StateGraph = None
+    _HAS_LANGGRAPH = False
 
-from app.gwy.llm.chat_service import ChatService
 from app.gwy.skills.position_analysis_skills import cleanup_analysis_report
+
+if TYPE_CHECKING:
+    from app.gwy.llm.chat_service import ChatService
 
 
 REPORT_GENERATOR_SYSTEM_PROMPT = """
@@ -32,11 +40,29 @@ class ReportState(TypedDict, total=False):
     title: str
     recommendations: list[dict[str, Any]]
     risk_review: dict[str, Any]
+    decision_matrix: dict[str, Any]
+    evidence_inventory: dict[str, Any]
+    verification_tasks: list[str]
     outline: list[str]
+    reflection: dict[str, Any]
+    validation: dict[str, Any]
     sections: list[str]
     report: str
     report_meta: dict[str, Any]
     trace: list[dict[str, Any]]
+
+
+class _FallbackGraph:
+    def __init__(self, agent: ReportGeneratorAgent) -> None:
+        self._agent = agent
+
+    def invoke(self, state: ReportState) -> dict[str, Any]:
+        current_state: dict[str, Any] = dict(state)
+        current_state.update(self._agent._node_plan(current_state))
+        current_state.update(self._agent._node_react(current_state))
+        current_state.update(self._agent._node_reflect(current_state))
+        current_state.update(self._agent._node_validate(current_state))
+        return current_state
 
 
 @dataclass(slots=True)
@@ -53,24 +79,34 @@ class ReportGeneratorAgent:
         title: str,
         recommendations: list[dict[str, Any]],
         risk_review: dict[str, Any],
+        decision_matrix: dict[str, Any] | None = None,
+        evidence_inventory: dict[str, Any] | None = None,
+        verification_tasks: list[str] | None = None,
     ) -> dict[str, Any]:
         state: ReportState = {
             "title": title,
             "recommendations": recommendations,
             "risk_review": risk_review,
+            "decision_matrix": dict(decision_matrix or {}),
+            "evidence_inventory": dict(evidence_inventory or {}),
+            "verification_tasks": list(verification_tasks or []),
             "trace": [],
         }
         return self.graph.invoke(state)
 
     def _build_graph(self) -> Any:
+        if not _HAS_LANGGRAPH:
+            return _FallbackGraph(self)
         builder = StateGraph(ReportState)
         builder.add_node("plan", self._node_plan)
-        builder.add_node("solve", self._node_solve)
-        builder.add_node("review", self._node_review)
+        builder.add_node("react", self._node_react)
+        builder.add_node("reflect", self._node_reflect)
+        builder.add_node("validate", self._node_validate)
         builder.add_edge(START, "plan")
-        builder.add_edge("plan", "solve")
-        builder.add_edge("solve", "review")
-        builder.add_edge("review", END)
+        builder.add_edge("plan", "react")
+        builder.add_edge("react", "reflect")
+        builder.add_edge("reflect", "validate")
+        builder.add_edge("validate", END)
         return builder.compile()
 
     def _node_plan(self, state: ReportState) -> dict[str, Any]:
@@ -105,18 +141,24 @@ class ReportGeneratorAgent:
         )
         return {"outline": outline, "trace": trace}
 
-    def _node_solve(self, state: ReportState) -> dict[str, Any]:
+    def _node_react(self, state: ReportState) -> dict[str, Any]:
         started_at = time.perf_counter()
         title = str(state.get("title") or "岗位推荐报告")
         outline = list(state.get("outline") or [])
         recommendations = list(state.get("recommendations") or [])
         risk_review = dict(state.get("risk_review") or {})
+        decision_matrix = dict(state.get("decision_matrix") or {})
+        evidence_inventory = dict(state.get("evidence_inventory") or {})
+        verification_tasks = list(state.get("verification_tasks") or [])
 
         draft = self._build_report_draft_v2(
             title=title,
             outline=outline,
             recommendations=recommendations,
             risk_review=risk_review,
+            decision_matrix=decision_matrix,
+            evidence_inventory=evidence_inventory,
+            verification_tasks=verification_tasks,
         )
 
         trace = list(state.get("trace") or [])
@@ -154,6 +196,9 @@ class ReportGeneratorAgent:
                             outline=outline,
                             recommendations=recommendations,
                             risk_review=risk_review,
+                            decision_matrix=decision_matrix,
+                            evidence_inventory=evidence_inventory,
+                            verification_tasks=verification_tasks,
                             draft=draft,
                         ),
                     },
@@ -185,6 +230,9 @@ class ReportGeneratorAgent:
                                     outline=outline,
                                     recommendations=recommendations,
                                     risk_review=risk_review,
+                                    decision_matrix=decision_matrix,
+                                    evidence_inventory=evidence_inventory,
+                                    verification_tasks=verification_tasks,
                                     draft=draft,
                                 )
                             ),
@@ -208,6 +256,9 @@ class ReportGeneratorAgent:
                                     outline=outline,
                                     recommendations=recommendations,
                                     risk_review=risk_review,
+                                    decision_matrix=decision_matrix,
+                                    evidence_inventory=evidence_inventory,
+                                    verification_tasks=verification_tasks,
                                     draft=draft,
                                 )
                             ),
@@ -288,6 +339,84 @@ class ReportGeneratorAgent:
 
         return {"report": report, "trace": trace}
 
+    def _node_solve(self, state: ReportState) -> dict[str, Any]:
+        return self._node_react(state)
+
+    def _node_reflect(self, state: ReportState) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        report = str(state.get("report") or "")
+        outline = list(state.get("outline") or [])
+        missing_sections = [section for section in outline if section not in report]
+        evidence_inventory = dict(state.get("evidence_inventory") or {})
+        verification_tasks = list(state.get("verification_tasks") or [])
+        reflection = {
+            "status": "needs_revision" if missing_sections else "ok",
+            "missing_sections": missing_sections,
+            "missing_evidence": list(evidence_inventory.get("missing") or []),
+            "verification_task_count": len(verification_tasks),
+            "next_action": "补齐缺失章节并重写结论" if missing_sections else "交给 validator 进行最终检查",
+        }
+
+        trace = list(state.get("trace") or [])
+        trace.append(
+            self._trace_entry(
+                step="reflect",
+                status=reflection["status"],
+                detail="宸叉牴鎹ぇ缁撴瀯銆佽瘉鎹拰鏍稿疄浠诲姟鍋氬鍐嶈",
+                started_at=started_at,
+                inputs_summary={
+                    "outline_count": len(outline),
+                    "report_length": len(report),
+                    "verification_task_count": len(verification_tasks),
+                },
+                outputs_summary={
+                    "missing_section_count": len(missing_sections),
+                    "missing_evidence_count": len(reflection["missing_evidence"]),
+                    "next_action": reflection["next_action"],
+                },
+            )
+        )
+
+        if missing_sections:
+            report = f"{report}\n\n> Review note: missing sections: {', '.join(missing_sections)}"
+
+        return {"report": report, "reflection": reflection, "trace": trace}
+
+    def _node_validate(self, state: ReportState) -> dict[str, Any]:
+        started_at = time.perf_counter()
+        report = str(state.get("report") or "")
+        outline = list(state.get("outline") or [])
+        reflection = dict(state.get("reflection") or {})
+        validation = self._validate_report(
+            report=report,
+            outline=outline,
+            reflection=reflection,
+        )
+
+        trace = list(state.get("trace") or [])
+        trace.append(
+            self._trace_entry(
+                step="validate",
+                status=validation["status"],
+                detail=validation["reason"],
+                started_at=started_at,
+                inputs_summary={
+                    "outline_count": len(outline),
+                    "report_length": len(report),
+                },
+                outputs_summary={
+                    "passed": validation["passed"],
+                    "issue_count": len(validation["issues"]),
+                },
+            )
+        )
+
+        report_meta = dict(state.get("report_meta") or {})
+        report_meta["validation_status"] = validation["status"]
+        report_meta["validation_issues"] = validation["issues"]
+
+        return {"validation": validation, "report_meta": report_meta, "trace": trace}
+
     def _build_report_draft(
         self,
         *,
@@ -295,6 +424,9 @@ class ReportGeneratorAgent:
         outline: list[str],
         recommendations: list[dict[str, Any]],
         risk_review: dict[str, Any],
+        decision_matrix: dict[str, Any],
+        evidence_inventory: dict[str, Any],
+        verification_tasks: list[str],
     ) -> str:
         lines: list[str] = [f"# {title}", ""]
         for section in outline:
@@ -387,6 +519,9 @@ class ReportGeneratorAgent:
         outline: list[str],
         recommendations: list[dict[str, Any]],
         risk_review: dict[str, Any],
+        decision_matrix: dict[str, Any],
+        evidence_inventory: dict[str, Any],
+        verification_tasks: list[str],
         draft: str,
     ) -> str:
         payload = {
@@ -394,11 +529,16 @@ class ReportGeneratorAgent:
             "outline": outline,
             "recommendations": recommendations[:5],
             "risk_review": risk_review,
+            "decision_matrix": decision_matrix,
+            "evidence_inventory": evidence_inventory,
+            "verification_tasks": verification_tasks,
             "draft": draft,
         }
         return (
-            "请将下面的结构化输入整理为一份更自然的 Markdown 岗位分析报告。\n"
-            "要求：保持原始事实不变，避免空话，保留标题结构，语气稳重。\n\n"
+            "请将下面的结构化输入整理为一份可直接支持报考决策的中文 Markdown 岗位分析报告。\n"
+            "先给直接结论，再给冲刺、主攻、保底、谨慎、排除分层和岗位横向比较。\n"
+            "每个岗位必须说明分层原因、最大风险、数据置信度、具体核验材料与动作，以及核验后如何改变结论。\n"
+            "不能把所有岗位都写成推荐；不能编造分数、报录比、进面分、概率或公告条件。未知数据必须保留为未知并转成具体补证任务，风险按岗位和风险类型去重。\n\n"
             f"{json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)}"
         )
 
@@ -409,6 +549,9 @@ class ReportGeneratorAgent:
         outline: list[str],
         recommendations: list[dict[str, Any]],
         risk_review: dict[str, Any],
+        decision_matrix: dict[str, Any],
+        evidence_inventory: dict[str, Any],
+        verification_tasks: list[str],
     ) -> str:
         lines: list[str] = [f"# {title}", ""]
         lines.extend(
@@ -418,6 +561,12 @@ class ReportGeneratorAgent:
                 "",
                 "## 判断依据",
                 self._build_reasoning_block(recommendations, risk_review),
+                "",
+                "## 岗位决策分层",
+                *self._build_decision_matrix_block(decision_matrix),
+                "",
+                "## 岗位横向比较",
+                *self._build_comparison_block(decision_matrix),
                 "",
                 "## 风险提醒",
                 self._build_risk_block(recommendations, risk_review),
@@ -438,13 +587,57 @@ class ReportGeneratorAgent:
                 self._build_final_recommendation_block(recommendations, risk_review),
                 "",
                 "## 下一步建议",
-                self._build_next_steps_block(recommendations, risk_review),
+                self._build_next_steps_block(
+                    recommendations,
+                    risk_review,
+                    verification_tasks=verification_tasks,
+                    evidence_inventory=evidence_inventory,
+                ),
             ]
         )
 
         if outline:
             lines.extend(["", "## 报告结构", *[f"- {item}" for item in outline]])
         return "\n".join(lines).strip()
+
+    def _build_decision_matrix_block(self, matrix: dict[str, Any]) -> list[str]:
+        items = list(matrix.get("items") or [])
+        if not items:
+            return ["- 当前尚未形成结构化岗位决策，需要先完成岗位研究。"]
+        lines: list[str] = []
+        tier_labels = {"sprint": "冲刺", "primary": "主攻", "backup": "保底", "caution": "谨慎", "exclude": "排除"}
+        for index, item in enumerate(items[:10], start=1):
+            tier = str(item.get("tier") or "unknown")
+            lines.append(
+                f"- {index}. {item.get('label') or item.get('position_id') or '未知岗位'} | "
+                f"分层：{tier_labels.get(tier, tier)} | 匹配度：{item.get('fit_score', '未知')} | "
+                f"竞争：{item.get('competition_level') or '未知'} | "
+                f"投入：{item.get('preparation_cost') or '未知'} | "
+                f"置信度：{item.get('confidence') or '未知'}"
+            )
+            for reason in list(item.get("reasons") or [])[:2]:
+                lines.append(f"  - 主要依据：{reason}")
+            for unknown in list(item.get("unknowns") or [])[:2]:
+                lines.append(f"  - 数据缺口：{unknown}")
+        return lines
+
+    def _build_comparison_block(self, matrix: dict[str, Any]) -> list[str]:
+        items = list(matrix.get("items") or [])
+        if len(items) < 2:
+            return ["- 当前候选岗位不足两个，暂时无法进行横向比较。"]
+        ranked = sorted(
+            items,
+            key=lambda item: (
+                self._tier_order(str(item.get("tier") or "")),
+                -int(item.get("fit_score") or 0),
+            ),
+        )
+        first = ranked[0].get("label") or ranked[0].get("position_id") or "未知岗位"
+        second = ranked[1].get("label") or ranked[1].get("position_id") or "未知岗位"
+        return [f"- 当前优先级：{first} 高于 {second}，依据是分层、匹配度、竞争信息和证据置信度。"]
+
+    def _tier_order(self, tier: str) -> int:
+        return {"primary": 0, "backup": 1, "sprint": 1, "caution": 2, "exclude": 3}.get(tier, 4)
 
     def _build_position_analysis_block(
         self,
@@ -510,6 +703,9 @@ class ReportGeneratorAgent:
         self,
         recommendations: list[dict[str, Any]],
         risk_review: dict[str, Any],
+        *,
+        verification_tasks: list[str],
+        evidence_inventory: dict[str, Any],
     ) -> str:
         lines = [
             "- 先确认学历、学位、专业、政治面貌、基层经历这些硬性条件。",
@@ -520,6 +716,10 @@ class ReportGeneratorAgent:
             lines.append("- 对风险等级高的岗位，先复核风险点再决定是否作为主报。")
         if len(recommendations) > 3:
             lines.append("- 如果想缩小范围，可以继续按地区、部门或竞争强度再筛一轮。")
+        for task in verification_tasks[:6]:
+            lines.append(f"- 核验任务：{task}")
+        for missing in list(evidence_inventory.get("missing") or [])[:6]:
+            lines.append(f"- 待补证据：{missing}")
         return "\n".join(lines)
 
     def _build_risk_block(
@@ -613,7 +813,7 @@ class ReportGeneratorAgent:
         outputs_summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
-        return {
+        payload = {
             "step": step,
             "status": status,
             "detail": detail,
@@ -621,4 +821,70 @@ class ReportGeneratorAgent:
             "inputs_summary": inputs_summary or {},
             "outputs_summary": outputs_summary or {},
             "evidence_refs": [],
+        }
+        payload.update(self._trace_context(step))
+        return payload
+
+    def _trace_context(self, step: str) -> dict[str, Any]:
+        mapping = {
+            "plan": {
+                "agent": "ReportGeneratorAgent",
+                "skill": "report_outline_planning",
+                "tool": "ArtifactComposer",
+                "backend": "Structured markdown composition",
+            },
+            "draft_report": {
+                "agent": "ReportGeneratorAgent",
+                "skill": "report_drafting",
+                "tool": "ArtifactComposer",
+                "backend": "Structured markdown composition",
+            },
+            "llm_polish": {
+                "agent": "ReportGeneratorAgent",
+                "skill": "reflection",
+                "tool": "ChatService",
+                "backend": "LLM polish fallback",
+            },
+            "reflect": {
+                "agent": "ReportGeneratorAgent",
+                "skill": "reflection",
+                "tool": "ReportReviewer",
+                "backend": "Consistency and coverage review",
+            },
+            "validate": {
+                "agent": "ReportGeneratorAgent",
+                "skill": "artifact_validation",
+                "tool": "ReportValidator",
+                "backend": "Markdown structure and evidence consistency check",
+            },
+            "review": {
+                "agent": "ReportGeneratorAgent",
+                "skill": "artifact_validation",
+                "tool": "ReportValidator",
+                "backend": "Markdown structure and evidence consistency check",
+            },
+        }
+        return mapping.get(step, {"agent": "ReportGeneratorAgent"})
+
+    def _validate_report(
+        self,
+        *,
+        report: str,
+        outline: list[str],
+        reflection: dict[str, Any],
+    ) -> dict[str, Any]:
+        issues: list[str] = []
+        if not report.strip():
+            issues.append("report_empty")
+        for section in outline:
+            if section not in report:
+                issues.append(f"missing_section:{section}")
+        for missing in list(reflection.get("missing_evidence") or []):
+            issues.append(f"missing_evidence:{missing}")
+        passed = not issues
+        return {
+            "status": "passed" if passed else "failed",
+            "passed": passed,
+            "issues": issues,
+            "reason": "report validation passed" if passed else "report validation failed",
         }

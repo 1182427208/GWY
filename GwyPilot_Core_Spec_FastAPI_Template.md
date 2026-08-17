@@ -577,7 +577,7 @@ trace_summary_skill
 
 ## 6. Agent Memory：简化版长短期记忆
 
-不要只做用户画像记忆。要做 Agent 长短期记忆，但 MVP 简化为 4 类。
+不要把它写成“用户画像记忆”这种抽象说法。这里描述的是一套可落地的 Agent 记忆实现：working memory 直接挂在 `LangGraph State` 和 Redis 上，conversation memory 负责当前对话的短期连续性，user decision memory 负责跨会话偏好沉淀，task memory 负责任务级上下文。实现上要明确写出数据流、存储位置和触发时机，而不是只说“有记忆”。
 
 ### 6.1 Working Memory
 

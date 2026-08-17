@@ -113,6 +113,50 @@ def test_citation_guard_returns_clear_message() -> None:
     assert result["retrieval_trace"][-1]["passed"] is False
 
 
+def test_generate_answer_uses_chat_service() -> None:
+    service = PolicyRagService(
+        session_service=DummySessionService(),
+        embedding_service=DummyEmbeddingService(),
+        rerank_service=DummyRerankService(),
+        chat_service=DummyChatService(),
+        milvus_store=DummyMilvusStore(),
+    )
+
+    result = service._generate_answer(
+        "prompt",
+        [{"doc_title": "报考指南", "section": "资格条件"}],
+    )
+
+    assert result == "unused"
+
+
+class FailingChatService(DummyChatService):
+    def chat_completion(
+        self,
+        messages: list[dict[str, object]],  # noqa: ARG002
+        temperature: float = 0.2,  # noqa: ARG002
+    ) -> str:
+        raise RuntimeError("llm unavailable")
+
+
+def test_generate_answer_has_evidence_fallback() -> None:
+    service = PolicyRagService(
+        session_service=DummySessionService(),
+        embedding_service=DummyEmbeddingService(),
+        rerank_service=DummyRerankService(),
+        chat_service=FailingChatService(),
+        milvus_store=DummyMilvusStore(),
+    )
+
+    result = service._generate_answer(
+        "prompt",
+        [{"doc_title": "报考指南", "section": "资格条件"}],
+    )
+
+    assert "报考指南" in result
+    assert "资格条件" in result
+
+
 def test_route_intent_routes_smalltalk_without_rag() -> None:
     routed = route_intent("你好")
 

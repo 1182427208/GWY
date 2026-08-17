@@ -1,0 +1,15 @@
+experiment_name: gwy_agent_eval_dev
+dataset_split: dev
+model: unavailable
+temperature: 0
+prompt_version: unavailable
+knowledge_version: unavailable
+job_table_version: unavailable
+top_k: 5
+max_agent_steps: 10
+enable_multi_agent: true
+enable_memory: true
+enable_web_verification: false
+enable_llm_judge: false
+mock_external_services: true
+

@@ -11,6 +11,7 @@ from sqlmodel import Session
 
 from app.api.deps import CurrentUser, SessionDep
 from app.core.db import engine
+from app.gwy.evals.service import record_online_evaluation
 from app.gwy.llm.chat_service import ChatService
 from app.gwy.models import (
     GwyPositionAnalysisSnapshot,
@@ -28,6 +29,7 @@ class PositionAnalysisTaskCreateRequest(BaseModel):
     title: str | None = None
     source_sheet: str | None = None
     notes: str | None = None
+    enable_evaluation: bool = False
 
 
 class PositionAnalysisSnapshotResponse(BaseModel):
@@ -98,6 +100,7 @@ def create_position_analysis_task(
         snapshot_payload["source_sheet"] = payload.source_sheet
     if payload.notes is not None:
         snapshot_payload["notes"] = payload.notes
+    snapshot_payload["enable_evaluation"] = payload.enable_evaluation
 
     service = PositionAnalysisService(session=session, chat_service=ChatService())
     result = service.create_task(snapshot=snapshot_payload, user_id=current_user.id)
@@ -248,6 +251,22 @@ def _run_position_analysis_task_background(
                 task_id=task_id,
                 user_id=user_id,
             )
+            task = background_session.get(GwyPositionAnalysisTask, UUID(task_id))
+            if task is not None and bool((task.input_json or {}).get("enable_evaluation")):
+                record_online_evaluation(
+                    session=background_session,
+                    user_id=UUID(user_id),
+                    source_type="position_analysis",
+                    source_id=task_id,
+                    query=str((task.input_json or {}).get("query") or ""),
+                    output={
+                        "answer": task.report_text or "",
+                        "report": task.report_text or "",
+                        "recommendations": (task.output_json or {}).get("recommendations", []),
+                        "trace": task.trace_json or [],
+                        "status": task.status,
+                    },
+                )
     except Exception as exc:
         logger.exception(
             "Position analysis background task failed",

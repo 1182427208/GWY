@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import base64
+import logging
+import mimetypes
 from pathlib import Path
 from typing import Any
 
+from app.core.config import settings
 from app.gwy.llm.siliconflow_client import SiliconFlowClient
+
+logger = logging.getLogger(__name__)
 
 
 class MultimodalSummaryService:
     def __init__(self, *, client: SiliconFlowClient | None = None) -> None:
-        self.client = client or SiliconFlowClient()
+        self.client = client or SiliconFlowClient(
+            chat_base_url=settings.SILICONFLOW_BASE_URL,
+            chat_api_key=settings.SILICONFLOW_API_KEY,
+            chat_model=settings.SILICONFLOW_CHAT_MODEL,
+        )
 
     def summarize_image(
         self,
@@ -38,7 +47,8 @@ class MultimodalSummaryService:
         try:
             image_bytes = path.read_bytes()
             image_data = base64.b64encode(image_bytes).decode("utf-8")
-            image_url = f"data:image/png;base64,{image_data}"
+            mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
+            image_url = f"data:{mime_type};base64,{image_data}"
             response = self.client.chat_completions(
                 [
                     {
@@ -69,6 +79,11 @@ class MultimodalSummaryService:
                 "extraction_status": "success",
             }
         except Exception:
+            logger.exception(
+                "Multimodal image summary failed | image_path=%s model=%s",
+                image_path,
+                settings.SILICONFLOW_CHAT_MODEL,
+            )
             return self._pending_summary(
                 image_path=image_path,
                 nearby_text=nearby_text,

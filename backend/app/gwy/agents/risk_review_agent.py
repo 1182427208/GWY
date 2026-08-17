@@ -30,7 +30,7 @@ class RiskReviewAgent:
     graph: Any = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.graph = self._build_graph()
+        self.graph = None
 
     def run(
         self,
@@ -42,8 +42,30 @@ class RiskReviewAgent:
             "query": query,
             "recommendations": recommendations,
             "trace": [],
+            "analysis_round": 0,
         }
-        return self.graph.invoke(state)
+        return self._run_loop(state)
+
+    def _run_loop(self, state: RiskReviewState) -> dict[str, Any]:
+        current_state: dict[str, Any] = dict(state)
+        next_step: str | None = "analyze"
+        safety = 0
+        while next_step and safety < 6:
+            safety += 1
+            step = next_step
+            next_step = None
+            if step == "analyze":
+                current_state.update(self._node_analyze(current_state))
+            elif step == "act":
+                current_state.update(self._node_act(current_state))
+            elif step == "observe":
+                current_state.update(self._node_observe(current_state))
+            elif step == "reflect":
+                current_state.update(self._node_reflect(current_state))
+            else:
+                break
+            next_step = self._decide_next_step(current_state, step)
+        return current_state
 
     def _build_graph(self) -> Any:
         builder = StateGraph(RiskReviewState)
@@ -57,6 +79,26 @@ class RiskReviewAgent:
         builder.add_edge("observe", "reflect")
         builder.add_edge("reflect", END)
         return builder.compile()
+
+    def _decide_next_step(self, state: RiskReviewState, current_step: str) -> str | None:
+        if current_step == "analyze":
+            return "act" if list(state.get("hypotheses") or []) else "reflect"
+        if current_step == "act":
+            return "observe"
+        if current_step == "observe":
+            evidence_hits = list(state.get("evidence_hits") or [])
+            hypotheses = list(state.get("hypotheses") or [])
+            analysis_round = int(state.get("analysis_round") or 0)
+            if not evidence_hits and hypotheses and analysis_round < 1:
+                state["analysis_round"] = analysis_round + 1
+                state["evidence_queries"] = self._broaden_evidence_queries(
+                    query=str(state.get("query") or ""),
+                    recommendations=list(state.get("recommendations") or []),
+                    hypotheses=hypotheses,
+                )
+                return "act"
+            return "reflect"
+        return None
 
     def _node_analyze(self, state: RiskReviewState) -> dict[str, Any]:
         hypotheses: list[dict[str, Any]] = []
@@ -83,7 +125,10 @@ class RiskReviewAgent:
         trace.append(
             {
                 "step": "risk_intent_analysis",
+                "agent": "RiskReviewAgent",
+                "skill": "risk_hypothesis_planning",
                 "hypothesis_count": len(hypotheses),
+                "analysis_round": int(state.get("analysis_round") or 0),
             }
         )
         return {
@@ -102,8 +147,12 @@ class RiskReviewAgent:
         trace.append(
             {
                 "step": "risk_act",
+                "agent": "RiskReviewAgent",
+                "tool": "MilvusPolicyStore.search / RerankService.rerank",
+                "backend": "Milvus + RerankService",
                 "evidence_query_count": len(evidence_queries),
                 "evidence_hit_count": len(evidence_hits),
+                "next_action": "observe",
             }
         )
         return {
@@ -120,8 +169,9 @@ class RiskReviewAgent:
             risk_level = "high" if matched_evidence and len(matched_evidence) > 1 else "medium"
             if not matched_evidence and hypothesis.get("trigger") in {"专业测试", "基层", "户籍", "证书", "加班", "值班"}:
                 risk_level = "medium"
-            risk_items.append(
+            risk_item = (
                 {
+                    "position_id": hypothesis.get("position_id"),
                     "risk_type": hypothesis.get("risk_type"),
                     "risk_level": risk_level,
                     "evidence": matched_evidence[0].get("content") if matched_evidence else hypothesis.get("remarks") or hypothesis.get("trigger"),
@@ -129,14 +179,34 @@ class RiskReviewAgent:
                     "suggestion": hypothesis.get("suggestion"),
                     "need_manual_confirm": bool(matched_evidence) or risk_level == "high",
                     "source": matched_evidence[0].get("doc_title") if matched_evidence else None,
+                    "verification_task": hypothesis.get("suggestion"),
+                    "decision_change_rule": (
+                        "若官方公告确认该限制不满足，则排除该岗位"
+                    ),
                 }
             )
+            key = (
+                str(risk_item.get("position_id") or ""),
+                str(risk_item.get("risk_type") or ""),
+            )
+            if not any(
+                (
+                    str(existing.get("position_id") or ""),
+                    str(existing.get("risk_type") or ""),
+                )
+                == key
+                for existing in risk_items
+            ):
+                risk_items.append(risk_item)
 
         trace = list(state.get("trace") or [])
         trace.append(
             {
                 "step": "risk_observe",
+                "agent": "RiskReviewAgent",
+                "skill": "reflection",
                 "risk_item_count": len(risk_items),
+                "next_action": "reflect",
             }
         )
         return {
@@ -162,8 +232,11 @@ class RiskReviewAgent:
         trace.append(
             {
                 "step": "risk_reflect",
+                "agent": "RiskReviewAgent",
+                "skill": "reflection",
                 "risk_level": risk_level,
                 "need_manual_confirm": need_manual_confirm,
+                "next_action": "done",
             }
         )
         return {
@@ -238,6 +311,25 @@ class RiskReviewAgent:
     def _build_evidence_query(self, title: str, trigger: str) -> str:
         parts = [part for part in [title, trigger, "官方公告", "资格条件"] if part]
         return " ".join(parts)
+
+    def _broaden_evidence_queries(
+        self,
+        *,
+        query: str,
+        recommendations: list[dict[str, Any]],
+        hypotheses: list[dict[str, Any]],
+    ) -> list[str]:
+        queries = [query]
+        for hypothesis in hypotheses[:3]:
+            title = str(hypothesis.get("job_title") or "").strip()
+            trigger = str(hypothesis.get("trigger") or "").strip()
+            if title:
+                queries.append(self._build_evidence_query(title, trigger or title))
+        for recommendation in recommendations[:2]:
+            title = str(recommendation.get("job_title") or "").strip()
+            if title:
+                queries.append(" ".join(part for part in [title, "瀹樻柟鍏憡", "杩涢潰鍒?"] if part))
+        return self._deduplicate(queries)
 
     def _deduplicate(self, values: list[str]) -> list[str]:
         seen: set[str] = set()

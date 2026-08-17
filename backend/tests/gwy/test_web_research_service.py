@@ -78,3 +78,77 @@ def test_verify_web_evidence_rejects_unsafe_urls() -> None:
         "unsupported_url_scheme",
         "blocked_private_host",
     }
+
+
+def test_verify_web_evidence_requires_official_source_for_competition_metrics() -> None:
+    service = WebResearchService(
+        search_service=FakeSearchService(
+            [
+                {
+                    "url": "https://example.com/blog/2026-score",
+                    "title": "某机构解析",
+                    "snippet": "进面分相关讨论",
+                }
+            ]
+        ),
+        fetch_service=FakeFetchService(
+            {
+                "https://example.com/blog/2026-score": {
+                    "title": "某机构解析",
+                    "text": "进面分相关讨论",
+                    "retrieved_via": "http",
+                }
+            }
+        ),
+        browser_service=FakeBrowserService({}),
+        min_text_length=100,
+    )
+
+    result = service.verify(
+        WebResearchRequest(
+            query="100110001001 2026报录比 进面人数 进面分",
+            planned_queries=["100110001001 中央办公厅 警卫局 法务管理岗位 一级主任科员及以下 进面分数"],
+            top_k=3,
+        )
+    )
+
+    assert result.insufficient_evidence is True
+    assert result.evidence == []
+    assert any(item["reason"] == "non_official_source_blocked" for item in result.failures)
+
+
+def test_verify_web_evidence_accepts_official_source_for_competition_metrics() -> None:
+    service = WebResearchService(
+        search_service=FakeSearchService(
+            [
+                {
+                    "url": "https://notice.gov.cn/2026/interview",
+                    "title": "面试名单公告",
+                    "snippet": "进面分与面试名单",
+                }
+            ]
+        ),
+        fetch_service=FakeFetchService(
+            {
+                "https://notice.gov.cn/2026/interview": {
+                    "title": "面试名单公告",
+                    "text": "进面分与面试名单",
+                    "retrieved_via": "http",
+                }
+            }
+        ),
+        browser_service=FakeBrowserService({}),
+        min_text_length=100,
+    )
+
+    result = service.verify(
+        WebResearchRequest(
+            query="100110001001 2026报录比 进面人数 进面分",
+            planned_queries=["100110001001 中央办公厅 警卫局 法务管理岗位 一级主任科员及以下 进面分数"],
+            top_k=3,
+        )
+    )
+
+    assert result.insufficient_evidence is False
+    assert result.evidence[0].credibility == "high"
+    assert result.evidence[0].source_domain == "notice.gov.cn"

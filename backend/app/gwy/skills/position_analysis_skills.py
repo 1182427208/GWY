@@ -40,6 +40,7 @@ def normalize_analysis_snapshot(snapshot: dict[str, Any] | None) -> dict[str, An
         "selected_position_ids": selected_position_ids,
         "visible_columns": visible_columns,
         "notes": notes,
+        "enable_evaluation": bool(payload.get("enable_evaluation")),
     }
     normalized["snapshot_json"].setdefault("title", title)
     if source_sheet:
@@ -379,6 +380,7 @@ def build_position_research_plan(
             len(records) < 2
             or history_summary.get("latest_recruit_count") is None
             or history_summary.get("latest_interview_ratio") is None
+            or _latest_interview_score(history_summary, records) is None
         )
         plan_items.append(
             {
@@ -443,6 +445,8 @@ def build_analysis_strategy(
             "record_count", 0
         ) < 2
         if history_summary.get("latest_interview_ratio") is None:
+            needs_web_search = True
+        if history_summary.get("latest_interview_score") is None:
             needs_web_search = True
         if needs_web_search:
             sparse_target_count += 1
@@ -512,10 +516,13 @@ def summarize_position_history(
     else:
         recruit_count = summary.get("latest_recruit_count")
         interview_ratio = summary.get("latest_interview_ratio")
+        interview_score = _latest_interview_score(summary, records)
         if recruit_count is not None:
             notes.append(f"最近一期招录人数约 {recruit_count}")
         if interview_ratio is not None:
             notes.append(f"最近一期报录比约 {interview_ratio:.2f}:1")
+        if interview_score is not None:
+            notes.append(f"最近一期进面分数约 {interview_score}")
         if summary.get("recruit_count_trend") == "upward":
             notes.append("招录人数呈上升趋势")
         elif summary.get("recruit_count_trend") == "downward":
@@ -531,11 +538,26 @@ def summarize_position_history(
         "history_years": [year for year in years if year is not None],
         "latest_recruit_count": summary.get("latest_recruit_count"),
         "latest_interview_ratio": summary.get("latest_interview_ratio"),
+        "latest_interview_score": _latest_interview_score(summary, records),
         "recruit_count_trend": summary.get("recruit_count_trend", "unknown"),
         "interview_ratio_trend": summary.get("interview_ratio_trend", "unknown"),
         "notes": notes,
         "records": records,
     }
+
+
+def _latest_interview_score(
+    summary: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> Any:
+    latest = summary.get("latest_interview_score")
+    if latest not in (None, "", [], {}):
+        return latest
+    for record in reversed(records):
+        value = record.get("interview_score")
+        if value not in (None, "", [], {}):
+            return value
+    return None
 
 
 def _match_strategy_position(

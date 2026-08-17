@@ -6,8 +6,17 @@ import { defineConfig } from "vite"
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  server: {
+    proxy: {
+      "/api": {
+        target: "http://localhost:8000",
+        changeOrigin: true,
+      },
+    },
+  },
   resolve: {
     alias: {
+      "@/client": path.resolve(__dirname, "./src/client/index.ts"),
       "@": path.resolve(__dirname, "./src"),
     },
   },

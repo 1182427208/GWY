@@ -1,3 +1,5 @@
+import logging
+
 import sentry_sdk
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
@@ -13,6 +15,30 @@ def custom_generate_unique_id(route: APIRoute) -> str:
 
 if settings.SENTRY_DSN and settings.ENVIRONMENT != "local":
     sentry_sdk.init(dsn=str(settings.SENTRY_DSN), enable_tracing=True)
+
+
+def configure_runtime_logging() -> None:
+    for logger_name in (
+        "httpx",
+        "httpcore",
+        "openai",
+        "openai._base_client",
+        "uvicorn.access",
+    ):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    access_logger = logging.getLogger("uvicorn.access")
+    access_logger.disabled = True
+    access_logger.propagate = False
+    hook_logger = logging.getLogger("app.gwy.agent_runtime.hooks")
+    hook_logger.setLevel(logging.INFO)
+    hook_logger.propagate = False
+    if not hook_logger.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(message)s"))
+        hook_logger.addHandler(handler)
+
+
+configure_runtime_logging()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,

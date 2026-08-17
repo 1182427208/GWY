@@ -7,6 +7,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.gwy.services.web_mcp_client import WebMCPClient
 
 
 @dataclass(slots=True)
@@ -27,11 +28,13 @@ class WebFetchService:
         self,
         *,
         enabled: bool | None = None,
+        web_mcp_enabled: bool = True,
         mcp_url: str | None = None,
         timeout: float | None = None,
         http_client: Any | None = None,
     ) -> None:
         self.enabled = True if enabled is None else enabled
+        self.web_mcp_enabled = web_mcp_enabled
         self.mcp_url = mcp_url or (
             str(settings.FETCH_MCP_URL) if settings.FETCH_MCP_URL else None
         )
@@ -44,6 +47,25 @@ class WebFetchService:
             return {}
 
         try:
+            if self.web_mcp_enabled and settings.WEB_MCP_URL is not None:
+                mcp_result = WebMCPClient(endpoint_url=str(settings.WEB_MCP_URL)).fetch(
+                    normalized_url
+                )
+                if mcp_result:
+                    return self._normalize_result(
+                        url=normalized_url,
+                        title=_as_text(mcp_result.get("title")),
+                        text=_as_text(mcp_result.get("text") or mcp_result.get("content")),
+                        content_type=_as_text(mcp_result.get("content_type")),
+                        status_code=mcp_result.get("status_code"),
+                        final_url=_as_text(mcp_result.get("url") or mcp_result.get("final_url"))
+                        or normalized_url,
+                        source="fetch",
+                        retrieved_via=str(
+                            mcp_result.get("retrieved_via") or "fetch_mcp"
+                        ),
+                        is_pdf=bool(mcp_result.get("is_pdf")),
+                    )
             if self.mcp_url:
                 return self._fetch_via_mcp(normalized_url)
             return self._fetch_via_http(normalized_url)

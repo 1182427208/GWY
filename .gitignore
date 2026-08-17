@@ -3,6 +3,8 @@
 .env.*
 !.env.example
 
+.superpowers/
+.copier/
 .vscode/*
 !.vscode/extensions.json
 node_modules/
@@ -10,17 +12,30 @@ node_modules/
 /test-results/
 /playwright-report/
 /blob-report/
+/frontend/test-results/
+/frontend/playwright-report/
+/frontend/blob-report/
 /playwright/.cache/
 /playwright/.auth/
 .playwright-cli/
 
 # Local reference repos and generated runtime artifacts
 giftia_ref/
+hello-agents/
+learn-claude-code-main/
 .worktrees/
 data/gwy_analysis_reports/
+data/processed/
 backend/test-output-*.txt
 frontend/test-output-*.txt
 docker/milvus/volumes/
+playwright-mcp-output/
+playwright-mcp*.log
+backend/playwright-server.log
+backend/.pytest-tmp/
+backend/.pytest_tmp/
+.pytest_tmp/
+_patch_*.txt
 
 # One-off local patch helpers
 scripts/_*.py

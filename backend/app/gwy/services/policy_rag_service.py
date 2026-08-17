@@ -1,37 +1,42 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
 import re
+import time
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, TypedDict
 from uuid import UUID
 
 from langgraph.graph import END, START, StateGraph
 from sqlmodel import Session, select
 
+from app.gwy.agents.feishu_push_agent import FeishuPushAgent
+from app.gwy.agents.position_decision_agent import PositionDecisionAgent
+from app.gwy.agents.report_generator_agent import ReportGeneratorAgent
+from app.gwy.agents.risk_review_agent import RiskReviewAgent
 from app.gwy.llm.chat_service import ChatService
 from app.gwy.llm.embedding_service import EmbeddingService
+from app.gwy.llm.multimodal_service import MultimodalSummaryService
 from app.gwy.llm.rerank_service import RerankService
-from app.gwy.agents.feishu_push_agent import FeishuPushAgent
+from app.gwy.models import GwyUserProfile
 from app.gwy.prompts.policy_rag import (
     DIRECT_ANSWER_SYSTEM_PROMPT,
     DIRECT_ANSWER_USER_PROMPT_TEMPLATE,
     POLICY_RAG_SYSTEM_PROMPT,
     POLICY_RAG_USER_PROMPT_TEMPLATE,
 )
-from app.gwy.agents.position_decision_agent import PositionDecisionAgent
-from app.gwy.agents.report_generator_agent import ReportGeneratorAgent
-from app.gwy.agents.risk_review_agent import RiskReviewAgent
+from app.gwy.services.agent_memory_service import AgentMemoryService
 from app.gwy.services.chat_session_service import ChatSessionService
 from app.gwy.services.hybrid_retrieval_service import HybridRetrievalService
-from app.gwy.models import GwyUserProfile
+from app.gwy.services.memory_side_query_service import MemorySideQueryService
 from app.gwy.skills.policy_rag_skills import (
     build_cache_key,
     build_doc_title_hint,
     build_metadata_filter_skill,
     build_rewritten_queries_skill,
     build_session_title_skill,
-    rrf_fusion_skill,
     route_intent_skill,
+    rrf_fusion_skill,
     unique_citation_docs_skill,
     unique_queries_skill,
 )
@@ -134,6 +139,7 @@ class PolicyRagService:
         mode: str | None = None,
         intent_hint: str | None = None,
         position_profile: dict[str, Any] | None = None,
+        memory_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         state: PolicyRagState = {
             "query": query,
@@ -151,7 +157,8 @@ class PolicyRagService:
             "retrieval_trace": [],
         }
         if session_id is not None and user_id is not None:
-            state["memory_context"] = self.session_service.get_memory_context(
+            state["memory_context"] = memory_context or self._load_side_query_memory(
+                query=query,
                 session_id=session_id,
                 user_id=user_id,
             )
@@ -330,7 +337,7 @@ class PolicyRagService:
             yield _sse_stage_event(
                 "direct_answer",
                 "running",
-                detail="正在生成直答",
+                detail="正在生成直接回答",
                 elapsed_ms=0,
             )
             answer_started_at = time.perf_counter()
@@ -350,7 +357,7 @@ class PolicyRagService:
             yield _sse_stage_event(
                 "direct_answer",
                 "done",
-                detail="已完成直答生成",
+                detail="已完成直接回答生成",
                 elapsed_ms=_elapsed_ms(answer_started_at),
             )
         answer = service._normalize_answer_text("".join(answer_parts))
@@ -424,6 +431,7 @@ class PolicyRagService:
         mode: str | None = None,
         intent_hint: str | None = None,
         position_profile: dict[str, Any] | None = None,
+        memory_context: dict[str, Any] | None = None,
     ) -> PolicyRagState:
         state: PolicyRagState = {
             "query": query,
@@ -441,7 +449,8 @@ class PolicyRagService:
             "retrieval_trace": [],
         }
         if session_id is not None and user_id is not None:
-            state["memory_context"] = self.session_service.get_memory_context(
+            state["memory_context"] = memory_context or self._load_side_query_memory(
+                query=query,
                 session_id=session_id,
                 user_id=user_id,
             )
@@ -457,6 +466,39 @@ class PolicyRagService:
         state.update(self._node_fuse_and_rerank(state))
         state.update(self._node_react_evidence_review(state))
         return state
+
+    def _load_side_query_memory(
+        self,
+        *,
+        query: str,
+        session_id: UUID,
+        user_id: UUID,
+    ) -> dict[str, Any]:
+        """Load only side-query-selected memory into policy prompts."""
+        try:
+            memory_service = AgentMemoryService(
+                session=self.session,
+                user_id=user_id,
+                conversation_id=str(session_id),
+            )
+            side_query = MemorySideQueryService(chat_service=self.chat_service)
+            result = side_query.retrieve(
+                query=query,
+                cards=memory_service.build_memory_catalog(),
+            )
+            memory_text = str(result.get("memory_text") or "").strip()
+            if not memory_text:
+                return {}
+            return {
+                "side_query_memory_text": memory_text,
+                "side_query_selected_names": list(
+                    result.get("selected_names") or []
+                ),
+            }
+        except Exception:
+            # Memory is optional for policy answering; retrieval failures must
+            # never block the primary RAG flow or trigger direct-memory fallback.
+            return {}
 
     def _build_result_payload(
         self,
@@ -911,6 +953,7 @@ class PolicyRagService:
 
     def _node_retrieve(self, state: PolicyRagState) -> dict[str, Any]:
         queries = unique_queries_skill([state["query"], *state.get("rewritten_queries", [])])
+        metadata_filter = state.get("metadata_filter")
         vector_results: list[list[dict[str, Any]]] = []
         for query in queries:
             cache_key = build_cache_key(
@@ -932,7 +975,7 @@ class PolicyRagService:
             query_vector = self.embedding_service.embed_text(query)
             hits = self.milvus_store.search(
                 query_vector=query_vector,
-                filter_expr=state["metadata_filter"],
+                filter_expr=metadata_filter,
                 top_k=max(state["top_k"], 8),
             )
             vector_results.append(hits)
@@ -941,14 +984,14 @@ class PolicyRagService:
                 query_hash=cache_key,
                 request_json={
                     "query": query,
-                    "metadata_filter": state["metadata_filter"],
+                    "metadata_filter": metadata_filter,
                     "top_k": state["top_k"],
                 },
                 response_json={"vector_results": hits},
             )
 
         bm25_candidates = self.milvus_store.query_documents(
-            filter_expr=state["metadata_filter"],
+            filter_expr=metadata_filter,
             limit=max(state["top_k"] * 20, 100),
         )
         bm25_results = self.hybrid_retrieval_service.score_documents(
@@ -963,7 +1006,7 @@ class PolicyRagService:
                 "step": "vector_search",
                 "query_count": len(queries),
                 "result_counts": [len(result) for result in vector_results],
-                "metadata_filter": state["metadata_filter"],
+                "metadata_filter": metadata_filter,
             }
         )
         trace.append(
@@ -1131,8 +1174,45 @@ class PolicyRagService:
             "session_attachments": list(state.get("session_attachments") or []),
         }
 
+    def _generate_answer(
+        self,
+        prompt: str,
+        citations: list[dict[str, Any]],
+    ) -> str:
+        """Generate an evidence-grounded answer with a deterministic fallback."""
+        try:
+            response = self.chat_service.chat_completion(
+                [
+                    {"role": "system", "content": POLICY_RAG_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+            )
+            if response and response.strip():
+                return self._normalize_answer_text(response)
+        except Exception:
+            pass
+
+        first = citations[0]
+        if first.get("source_kind") == "session_attachment":
+            answer = (
+                f"根据你上传的附件《{first.get('original_name') or first.get('file_name') or '未命名附件'}》，"
+                f"当前可参考的摘要是：{first.get('summary') or first.get('content') or '暂无摘要'}。"
+            )
+            if len(citations) > 1:
+                answer += " 结合其他附件信息，建议继续补充更明确的问题。"
+            return self._normalize_answer_text(answer)
+
+        answer = (
+            f"根据知识库资料，{first.get('doc_title') or '相关文档'}中关于"
+            f"{first.get('section') or '相关章节'}的说明可以作为参考。"
+        )
+        if len(citations) > 1:
+            answer += " 结合多条证据，可以进一步核对对应原文。"
+        return self._normalize_answer_text(answer)
+
     def _build_follow_up_evidence_query(self, state: PolicyRagState) -> str:
-        parts = [str(state.get("query") or "").strip(), "官方依据", "资格条件"]
+        parts = [str(state.get("query") or "").strip(), "瀹樻柟渚濇嵁", "璧勬牸鏉′欢"]
         if state.get("doc_group"):
             parts.append(str(state.get("doc_group")))
         if state.get("doc_type"):
@@ -1158,6 +1238,44 @@ class PolicyRagService:
             seen.add(key)
             merged.append(item)
         return merged
+
+    def _build_evidence_block(self, citations: list[dict[str, Any]]) -> str:
+        if not citations:
+            return "当前知识库未检索到明确证据。"
+
+        blocks: list[str] = []
+        for index, item in enumerate(citations[:8], start=1):
+            title = (
+                item.get("doc_title")
+                or item.get("source_file")
+                or item.get("original_name")
+                or item.get("file_name")
+                or "未命名来源"
+            )
+            section = item.get("section")
+            page_start = item.get("page_start")
+            page_end = item.get("page_end")
+            score = item.get("rerank_score", item.get("score"))
+            content = (
+                item.get("content_excerpt")
+                or item.get("content")
+                or item.get("summary")
+                or item.get("extracted_text")
+                or ""
+            )
+            content_text = self._excerpt(str(content), limit=900) if content else "无摘要"
+
+            lines = [f"[{index}] {title}"]
+            if section:
+                lines.append(f"章节：{section}")
+            if page_start is not None or page_end is not None:
+                lines.append(f"页码：{page_start or '?'}-{page_end or page_start or '?'}")
+            if score is not None:
+                lines.append(f"相关度：{score}")
+            lines.append(f"内容：{content_text}")
+            blocks.append("\n".join(lines))
+
+        return "\n\n".join(blocks)
 
     def _build_answer_prompt(
         self,
@@ -1200,23 +1318,24 @@ class PolicyRagService:
         lines: list[str] = [
             "以下记忆仅供参考，遇到冲突时以用户最新明确说明为准。",
         ]
-
+        side_query_memory_text = str(
+            memory_context.get("side_query_memory_text") or ""
+        ).strip()
+        if side_query_memory_text:
+            lines.append("按需加载的历史记忆：")
+            lines.append(side_query_memory_text)
         session_summary = str(memory_context.get("session_summary") or "").strip()
         if session_summary:
             lines.append(f"会话摘要：{session_summary}")
-
         active_topic = str(memory_context.get("active_topic") or "").strip()
         if active_topic:
             lines.append(f"当前话题：{active_topic}")
-
         last_intent = str(memory_context.get("last_intent") or "").strip()
         if last_intent:
             lines.append(f"最近意图：{last_intent}")
-
         open_topics = memory_context.get("open_topics") or []
         if open_topics:
             lines.append("待跟进话题：" + "、".join(str(item) for item in open_topics[:5]))
-
         recent_messages = memory_context.get("recent_messages") or []
         if recent_messages:
             recent_lines: list[str] = []
@@ -1228,196 +1347,24 @@ class PolicyRagService:
                 recent_lines.append(f"{role}：{content}")
             if recent_lines:
                 lines.append("最近对话：" + "；".join(recent_lines))
-
         long_term_context = memory_context.get("long_term_context") or {}
         if long_term_context:
-            long_term_parts: list[str] = []
-            user_profile = long_term_context.get("user_profile") or {}
-            if user_profile:
-                profile_parts: list[str] = []
-                profile_fields = [
-                    ("political_status", "政治面貌"),
-                    ("major", "专业"),
-                    ("education", "学历"),
-                    ("degree", "学位"),
-                    ("name", "姓名"),
-                    ("nickname", "昵称"),
-                    ("target_regions", "地区偏好"),
-                    ("desired_departments", "部门偏好"),
-                    ("desired_positions", "岗位偏好"),
-                    ("is_fresh_graduate", "应届"),
-                    ("grassroots_experience_years", "基层年限"),
-                ]
-                for key, label in profile_fields:
-                    value = user_profile.get(key)
-                    if value in (None, "", [], {}):
-                        continue
-                    profile_parts.append(f"{label}={value}")
-                if profile_parts:
-                    long_term_parts.append("用户基础资料（仅供参考，冲突时以后续说明为准）=" + "、".join(profile_parts))
-
-            liked_departments = long_term_context.get("liked_departments") or []
-            if liked_departments:
-                long_term_parts.append(
-                    "喜欢的部门：" + "、".join(str(item) for item in liked_departments[:5])
-                )
-
-            liked_job_titles = long_term_context.get("liked_job_titles") or []
-            if liked_job_titles:
-                long_term_parts.append(
-                    "喜欢的岗位：" + "、".join(str(item) for item in liked_job_titles[:5])
-                )
-
-            total_analyses = long_term_context.get("total_analyses")
-            total_decisions = long_term_context.get("total_decisions")
-            if total_analyses is not None:
-                long_term_parts.append(f"历史分析次数={total_analyses}")
-            if total_decisions is not None:
-                long_term_parts.append(f"历史决策次数={total_decisions}")
-
-            last_analysis_at = str(long_term_context.get("last_analysis_at") or "").strip()
-            if last_analysis_at:
-                long_term_parts.append(f"最近分析时间={last_analysis_at}")
-
-            if long_term_parts:
-                lines.append("长期记忆：" + "；".join(long_term_parts))
-
+            summary_parts = self._summarize_long_term_context(long_term_context)
+            if summary_parts:
+                lines.append("长期记忆：" + "；".join(summary_parts))
         return "\n".join(lines)
-
-    def _generate_direct_answer(
-        self,
-        prompt: str,
-        state: PolicyRagState,
-    ) -> str:
-        intent = str(state.get("intent") or "")
-        if intent == "general_chat":
-            normalized_query = str(state.get("query") or "").strip()
-            if any(token in normalized_query for token in ("你好", "您好", "hi", "hello", "在吗", "在么")):
-                return "你好，我在。你可以直接告诉我你想问的政策问题，或者上传文件让我帮你看。"
-            if "谢谢" in normalized_query or "多谢" in normalized_query:
-                return "不客气，随时可以继续问我。"
-
-        try:
-            response = self.chat_service.chat_completion(
-                [
-                    {"role": "system", "content": DIRECT_ANSWER_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-            )
-            if response.strip():
-                return self._normalize_answer_text(response)
-        except Exception:
-            pass
-
-        fallback = "你好，我在。你可以直接告诉我你的问题。"
-        return self._normalize_answer_text(fallback)
-
-    def _generate_answer(
-        self,
-        prompt: str,
-        citations: list[dict[str, Any]],
-    ) -> str:
-        try:
-            response = self.chat_service.chat_completion(
-                [
-                    {"role": "system", "content": POLICY_RAG_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-            )
-            if response.strip():
-                return self._normalize_answer_text(response)
-        except Exception:
-            pass
-
-        first = citations[0]
-        if first.get("source_kind") == "session_attachment":
-            answer = (
-                f"根据你上传的附件《{first.get('original_name') or first.get('file_name') or '未命名附件'}》，"
-                f"当前可参考的摘要是：{first.get('summary') or first.get('content') or '暂无摘要'}。"
-            )
-            if len(citations) > 1:
-                answer += " 结合其他附件信息，建议继续补充更明确的问题。"
-            return self._normalize_answer_text(answer)
-
-        answer = (
-            f"根据知识库资料，{first.get('doc_title') or '相关文档'}中关于"
-            f"{first.get('section') or '相关章节'}的说明可以作为参考。"
-        )
-        if len(citations) > 1:
-            answer += " 结合多条证据，可以进一步核对对应原文。"
-        return self._normalize_answer_text(answer)
-
-    def _generate_answer_streaming(self, state: PolicyRagState) -> str:
-        citations = list(state.get("citations") or [])
-        if not citations:
-            return self._normalize_answer_text("当前知识库未找到明确依据。")
-
-        prompt = self._build_answer_prompt(state, citations)
-        chunks: list[str] = []
-        try:
-            for chunk in self.chat_service.stream_chat_completion(
-                [
-                    {"role": "system", "content": POLICY_RAG_SYSTEM_PROMPT},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0.2,
-            ):
-                if not isinstance(chunk, dict):
-                    continue
-                if chunk.get("type") != "content":
-                    continue
-                text = str(chunk.get("text") or "")
-                if not text:
-                    continue
-                cleaned = text.replace("*", "")
-                if cleaned:
-                    chunks.append(cleaned)
-        except Exception:
-            return self._generate_answer(prompt, citations)
-
-        answer = "".join(chunks)
-        if answer.strip():
-            return self._normalize_answer_text(answer)
-        return self._generate_answer(prompt, citations)
-
-    def _build_evidence_block(self, citations: list[dict[str, Any]]) -> str:
-        blocks: list[str] = []
-        for index, citation in enumerate(citations, start=1):
-            if citation.get("source_kind") == "session_attachment":
-                blocks.append(
-                    "\n".join(
-                        [
-                            f"[{index}] 会话附件：{citation.get('original_name') or citation.get('file_name') or '未命名附件'}",
-                            f"类型：{citation.get('attachment_type') or ''}",
-                            f"路径：{citation.get('file_path') or ''}",
-                            f"摘要：{citation.get('summary') or ''}",
-                            f"文本：{citation.get('extracted_text') or ''}",
-                        ]
-                    )
-                )
-                continue
-
-            blocks.append(
-                "\n".join(
-                    [
-                        f"[{index}] {citation.get('doc_title') or '未命名文档'}",
-                        f"来源：{citation.get('source_file') or ''}",
-                        f"章节：{citation.get('section') or ''}",
-                        f"页码：{citation.get('page_start') or ''}-{citation.get('page_end') or ''}",
-                        f"内容：{citation.get('content') or ''}",
-                    ]
-                )
-            )
-        return "\n\n".join(blocks)
-
     def _build_memory_block(self, memory_context: dict[str, Any] | None) -> str:
         if not memory_context:
             return "无"
         lines: list[str] = [
             "以下记忆仅供参考，遇到冲突时以用户最新明确说明为准；不要把不确定的信息说成定论。",
         ]
+        side_query_memory_text = str(
+            memory_context.get("side_query_memory_text") or ""
+        ).strip()
+        if side_query_memory_text:
+            lines.append("按需加载的历史记忆：")
+            lines.append(side_query_memory_text)
         session_summary = str(memory_context.get("session_summary") or "").strip()
         if session_summary:
             lines.append(f"会话摘要：{session_summary}")
@@ -1429,91 +1376,75 @@ class PolicyRagService:
             lines.append(f"最近意图：{last_intent}")
         mentioned_docs = memory_context.get("mentioned_docs") or []
         if mentioned_docs:
-            joined_docs = "、".join(str(item) for item in mentioned_docs)
-            lines.append(f"已提及资料：{joined_docs}")
-        recent_messages = memory_context.get("recent_messages") or []
-        if recent_messages:
-            recent_lines: list[str] = []
-            for item in recent_messages[-4:]:
-                role = "用户" if item.get("role") == "user" else "助手"
-                content = str(item.get("content") or "").replace("\n", " ").strip()
-                if len(content) > 80:
-                    content = f"{content[:77]}..."
-                recent_lines.append(f"{role}：{content}")
-            if recent_lines:
-                lines.append("最近对话：" + "；".join(recent_lines))
+            lines.append("已提及资料：" + "、".join(str(item) for item in mentioned_docs))
         conversation_memory = memory_context.get("conversation_memory") or {}
         if conversation_memory:
-            memory_parts: list[str] = []
-            for key, value in conversation_memory.items():
-                if not value:
-                    continue
-                if isinstance(value, dict) and len(value) == 1:
-                    memory_parts.append(f"{key}={next(iter(value.values()))}")
-                else:
-                    memory_parts.append(f"{key}={value}")
+            memory_parts = [f"{key}={value}" for key, value in conversation_memory.items() if value]
             if memory_parts:
                 lines.append("短期记忆：" + "；".join(memory_parts))
         long_term_context = memory_context.get("long_term_context") or {}
         if long_term_context:
-            long_term_parts: list[str] = []
-            user_profile = long_term_context.get("user_profile") or {}
-            if user_profile:
-                profile_parts: list[str] = []
-                profile_fields = [
-                    ("name", "姓名"),
-                    ("nickname", "昵称"),
-                    ("major", "专业"),
-                    ("education", "学历"),
-                    ("degree", "学位"),
-                    ("political_status", "政治面貌"),
-                    ("target_regions", "地区偏好"),
-                    ("desired_departments", "部门偏好"),
-                    ("desired_positions", "岗位偏好"),
-                    ("is_fresh_graduate", "应届"),
-                    ("grassroots_experience_years", "基层年限"),
-                ]
-                for key, label in profile_fields:
-                    value = user_profile.get(key)
-                    if value in (None, "", [], {}):
-                        continue
-                    profile_parts.append(f"{label}={value}")
-                if profile_parts:
-                    long_term_parts.append("用户基础资料（仅供参考）=" + "、".join(profile_parts))
-            liked_departments = long_term_context.get("liked_departments") or []
-            if liked_departments:
-                long_term_parts.append(
-                    "喜欢的部门=" + "、".join(str(item) for item in liked_departments[:5])
-                )
-            liked_job_titles = long_term_context.get("liked_job_titles") or []
-            if liked_job_titles:
-                long_term_parts.append(
-                    "喜欢的岗位=" + "、".join(str(item) for item in liked_job_titles[:5])
-                )
-            total_analyses = long_term_context.get("total_analyses")
-            total_decisions = long_term_context.get("total_decisions")
-            if total_analyses is not None:
-                long_term_parts.append(f"历史分析次数={total_analyses}")
-            if total_decisions is not None:
-                long_term_parts.append(f"历史决策次数={total_decisions}")
-            last_analysis_at = str(long_term_context.get("last_analysis_at") or "").strip()
-            if last_analysis_at:
-                long_term_parts.append(f"最近分析时间={last_analysis_at}")
-            if long_term_parts:
-                lines.append("长期记忆：" + "；".join(long_term_parts))
+            summary_parts = self._summarize_long_term_context(long_term_context)
+            if summary_parts:
+                lines.append("长期记忆：" + "；".join(summary_parts))
         return "\n".join(lines) if lines else "无"
+    def _summarize_long_term_context(self, long_term_context: dict[str, Any]) -> list[str]:
+        parts: list[str] = []
+        user_profile = long_term_context.get("user_profile") or {}
+        if user_profile:
+            profile_parts: list[str] = []
+            profile_fields = [
+                ("name", "姓名"),
+                ("nickname", "昵称"),
+                ("major", "专业"),
+                ("education", "学历"),
+                ("degree", "学位"),
+                ("political_status", "政治面貌"),
+                ("target_regions", "地区偏好"),
+                ("desired_departments", "部门偏好"),
+                ("desired_positions", "岗位偏好"),
+                ("is_fresh_graduate", "应届"),
+                ("grassroots_experience_years", "基层年限"),
+            ]
+            for key, label in profile_fields:
+                value = user_profile.get(key)
+                if value in (None, "", [], {}):
+                    continue
+                profile_parts.append(f"{label}={value}")
+            if profile_parts:
+                parts.append("用户基础资料=" + "、".join(profile_parts))
+        liked_departments = long_term_context.get("liked_departments") or []
+        if liked_departments:
+            parts.append("喜欢的部门=" + "、".join(str(item) for item in liked_departments[:5]))
+        liked_job_titles = long_term_context.get("liked_job_titles") or []
+        if liked_job_titles:
+            parts.append("喜欢的岗位=" + "、".join(str(item) for item in liked_job_titles[:5]))
+        total_analyses = long_term_context.get("total_analyses")
+        if total_analyses is not None:
+            parts.append(f"历史分析次数={total_analyses}")
+        total_decisions = long_term_context.get("total_decisions")
+        if total_decisions is not None:
+            parts.append(f"历史决策次数={total_decisions}")
+        last_analysis_at = str(long_term_context.get("last_analysis_at") or "").strip()
+        if last_analysis_at:
+            parts.append(f"最近分析时间={last_analysis_at}")
+        return parts
 
     def _normalize_answer_text(self, text: str) -> str:
-        cleaned = text.replace("*", "").replace("```", "")
+        cleaned = text.replace("```", "").replace("**", "").replace("__", "")
         lines: list[str] = []
+        bullet_prefixes = ("-", "•", "·", "∙", "●", "◦", "▪", "▫", "–", "—", "◆", "◇", "○", "■", "□")
         for raw_line in cleaned.splitlines():
             line = raw_line.strip()
             if not line:
                 if lines and lines[-1] != "":
                     lines.append("")
                 continue
-            line = re.sub(r"^[•·]\s*", "", line)
-            line = re.sub(r"^[-–—]\s+", "", line)
+            line = re.sub(r"^#{1,6}\s*", "", line)
+            line = re.sub(r"^\*+\s*", "", line)
+            while line and line[0] in bullet_prefixes:
+                line = line[1:].lstrip()
+            line = line.replace("*", "")
             lines.append(line)
         normalized = "\n".join(lines)
         normalized = re.sub(r"\n{3,}", "\n\n", normalized)
@@ -1678,18 +1609,71 @@ class PolicyRagService:
         user_id: UUID,
     ) -> list[dict[str, Any]]:
         attachments = self.session_service.list_attachments(session_id, user_id)
-        return [
-            {
-                "id": str(attachment.id),
-                "file_name": attachment.file_name,
-                "original_name": attachment.original_name,
-                "attachment_type": attachment.attachment_type,
-                "mime_type": attachment.mime_type,
-                "file_path": attachment.file_path,
-                "summary": attachment.summary,
-                "extracted_text": attachment.extracted_text,
-                "extraction_status": attachment.extraction_status,
-                "metadata_json": dict(attachment.metadata_json or {}),
-            }
-            for attachment in attachments
-        ]
+        multimodal_service: MultimodalSummaryService | None = None
+        updated = False
+        serialized: list[dict[str, Any]] = []
+        for attachment in attachments:
+            if (
+                attachment.attachment_type == "other"
+                and Path(attachment.file_path or "").suffix.lower() in {
+                    ".txt",
+                    ".md",
+                    ".markdown",
+                    ".csv",
+                    ".json",
+                    ".log",
+                    ".xml",
+                    ".html",
+                    ".htm",
+                }
+                and attachment.file_path
+            ):
+                try:
+                    extracted_text = Path(attachment.file_path).read_text(
+                        encoding="utf-8",
+                        errors="replace",
+                    ).strip()
+                    attachment.attachment_type = "text"
+                    attachment.extracted_text = extracted_text
+                    attachment.summary = self._excerpt(extracted_text, limit=800)
+                    attachment.extraction_status = "text_extracted"
+                    self.session.add(attachment)
+                    updated = True
+                except Exception:
+                    pass
+            if (
+                attachment.attachment_type == "image"
+                and attachment.extraction_status != "success"
+                and attachment.file_path
+            ):
+                if multimodal_service is None:
+                    multimodal_service = MultimodalSummaryService()
+                result = multimodal_service.summarize_image(
+                    image_path=attachment.file_path,
+                    source_file=attachment.original_name,
+                )
+                attachment.summary = str(result.get("summary") or "")
+                attachment.extracted_text = str(result.get("ocr_text") or "")
+                attachment.extraction_status = str(
+                    result.get("extraction_status") or "pending_multimodal_summary"
+                )
+                self.session.add(attachment)
+                updated = True
+
+            serialized.append(
+                {
+                    "id": str(attachment.id),
+                    "file_name": attachment.file_name,
+                    "original_name": attachment.original_name,
+                    "attachment_type": attachment.attachment_type,
+                    "mime_type": attachment.mime_type,
+                    "file_path": attachment.file_path,
+                    "summary": attachment.summary,
+                    "extracted_text": attachment.extracted_text,
+                    "extraction_status": attachment.extraction_status,
+                    "metadata_json": dict(attachment.metadata_json or {}),
+                }
+            )
+        if updated:
+            self.session.commit()
+        return serialized

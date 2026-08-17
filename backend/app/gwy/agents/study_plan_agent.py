@@ -7,8 +7,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, TypedDict
 
-from langgraph.graph import END, START, StateGraph
-
 from app.gwy.llm.chat_service import ChatService
 from app.gwy.prompts.study_plan import (
     STUDY_PLAN_SYSTEM_PROMPT,
@@ -41,6 +39,8 @@ class StudyPlanState(TypedDict, total=False):
     plan_title: str
     plan_markdown: str
     study_tips: list[str]
+    reflection: dict[str, Any]
+    validation: dict[str, Any]
     status: str
     trace: list[dict[str, Any]]
 
@@ -48,11 +48,11 @@ class StudyPlanState(TypedDict, total=False):
 @dataclass(slots=True)
 class StudyPlanAgent:
     chat_service: ChatService | None = None
-    graph: Any = field(init=False, repr=False)
+    graph: Any = field(init=False, repr=False, default=None)
 
     def __post_init__(self) -> None:
         self.chat_service = self.chat_service or ChatService()
-        self.graph = self._build_graph()
+        self.graph = None
 
     def run(
         self,
@@ -72,22 +72,14 @@ class StudyPlanAgent:
             "trace": [],
             "status": "running",
         }
-        return self.graph.invoke(state)
-
-    def _build_graph(self) -> Any:
-        builder = StateGraph(StudyPlanState)
-        builder.add_node("analyze_profile", self._node_analyze_profile)
-        builder.add_node("plan_phases", self._node_plan_phases)
-        builder.add_node("generate_subjects", self._node_generate_subjects)
-        builder.add_node("schedule_tasks", self._node_schedule_tasks)
-        builder.add_node("compose_plan", self._node_compose_plan)
-        builder.add_edge(START, "analyze_profile")
-        builder.add_edge("analyze_profile", "plan_phases")
-        builder.add_edge("plan_phases", "generate_subjects")
-        builder.add_edge("generate_subjects", "schedule_tasks")
-        builder.add_edge("schedule_tasks", "compose_plan")
-        builder.add_edge("compose_plan", END)
-        return builder.compile()
+        state.update(self._node_analyze_profile(state))
+        state.update(self._node_plan_phases(state))
+        state.update(self._node_generate_subjects(state))
+        state.update(self._node_schedule_tasks(state))
+        state.update(self._node_compose_plan(state))
+        state.update(self._node_reflect_plan(state))
+        state.update(self._node_validate_plan(state))
+        return state
 
     # ?? nodes ????????????????????????????????????????????????????
 
@@ -105,6 +97,8 @@ class StudyPlanAgent:
         )
 
         self._record_trace(state, "analyze_profile", {
+            "agent": "StudyPlanAgent",
+            "skill": "analyze_exam_subjects",
             "exam_date": str(exam_date),
             "subjects": list(subjects_result.get("subjects", {}).keys()),
         })
@@ -135,6 +129,8 @@ class StudyPlanAgent:
         total_weeks = max(p["week_end"] for p in phases) if phases else 12
 
         self._record_trace(state, "plan_phases", {
+            "agent": "StudyPlanAgent",
+            "skill": "generate_phase_schedule",
             "phase_count": len(phases),
             "total_weeks": total_weeks,
         })
@@ -159,6 +155,8 @@ class StudyPlanAgent:
             info["total_hours"] = int(total_hours * weight / 100)
 
         self._record_trace(state, "generate_subjects", {
+            "agent": "StudyPlanAgent",
+            "skill": "build_subject_checklist",
             "subject_count": len(checklist),
         })
 
@@ -227,6 +225,8 @@ class StudyPlanAgent:
                     })
 
         self._record_trace(state, "schedule_tasks", {
+            "agent": "StudyPlanAgent",
+            "skill": "format_study_plan_markdown",
             "task_count": len(all_tasks),
         })
 
@@ -296,12 +296,71 @@ class StudyPlanAgent:
             tasks=tasks,
         )
 
+        self._record_trace(state, "compose_plan", {
+            "agent": "StudyPlanAgent",
+            "skill": "artifact_composition",
+            "status": "completed",
+            "plan_title": plan_title,
+            "phase_count": len(phases),
+            "task_count": len(tasks),
+            "used_llm": bool(plan_json),
+        })
+
         return {
             "plan_title": plan_title,
             "plan_markdown": plan_markdown,
             "llm_plan_json": plan_json,
             "study_tips": study_tips,
             "status": "completed",
+        }
+
+    def _node_reflect_plan(self, state: StudyPlanState) -> dict[str, Any]:
+        import time
+
+        started_at = time.perf_counter()
+        phases = list(state.get("phases") or [])
+        tasks = list(state.get("tasks") or [])
+        subjects = dict(state.get("subject_checklist") or {})
+        total_weeks = int(state.get("total_weeks") or 0)
+        reflection = self._reflect_study_plan(
+            phases=phases,
+            tasks=tasks,
+            subjects=subjects,
+            total_weeks=total_weeks,
+        )
+        self._record_trace(state, "reflect_plan", {
+            "agent": "StudyPlanAgent",
+            "skill": "reflection",
+            "status": reflection["status"],
+            "missing_items": reflection["missing_items"],
+            "next_action": reflection["next_action"],
+            "phase_count": len(phases),
+            "task_count": len(tasks),
+        })
+
+        return {"reflection": reflection}
+
+    def _node_validate_plan(self, state: StudyPlanState) -> dict[str, Any]:
+        import time
+
+        started_at = time.perf_counter()
+        validation = self._validate_study_plan(
+            phases=list(state.get("phases") or []),
+            tasks=list(state.get("tasks") or []),
+            subjects=dict(state.get("subject_checklist") or {}),
+            total_weeks=int(state.get("total_weeks") or 0),
+        )
+        self._record_trace(state, "validate_plan", {
+            "agent": "StudyPlanAgent",
+            "skill": "artifact_validation",
+            "status": validation["status"],
+            "issue_count": len(validation["issues"]),
+            "passed": validation["passed"],
+        })
+
+        return {
+            "validation": validation,
+            "status": validation["status"],
         }
 
     # ?? helpers ???????????????????????????????????????????????????
@@ -311,8 +370,105 @@ class StudyPlanAgent:
     ) -> None:
         import time
         trace = state.setdefault("trace", [])
-        trace.append({
+        entry = {
             "node": node,
             "ts": time.time(),
             "payload": payload,
-        })
+        }
+        entry.update(self._trace_context(node))
+        trace.append(entry)
+
+    def _trace_context(self, node: str) -> dict[str, Any]:
+        mapping = {
+            "analyze_profile": {
+                "agent": "StudyPlanAgent",
+                "skill": "analyze_exam_subjects",
+                "tool": "StudyPlanSkill",
+                "backend": "Profile and recommendation analysis",
+            },
+            "plan_phases": {
+                "agent": "StudyPlanAgent",
+                "skill": "generate_phase_schedule",
+                "tool": "StudyPlanSkill",
+                "backend": "Phase allocation and timeline planning",
+            },
+            "generate_subjects": {
+                "agent": "StudyPlanAgent",
+                "skill": "build_subject_checklist",
+                "tool": "StudyPlanSkill",
+                "backend": "Subject coverage and hour allocation",
+            },
+            "schedule_tasks": {
+                "agent": "StudyPlanAgent",
+                "skill": "daily_task_scheduling",
+                "tool": "StudyPlanSkill",
+                "backend": "Daily practice/task generation",
+            },
+            "compose_plan": {
+                "agent": "StudyPlanAgent",
+                "skill": "artifact_composition",
+                "tool": "ChatService",
+                "backend": "Markdown + optional LLM polish",
+            },
+            "reflect_plan": {
+                "agent": "StudyPlanAgent",
+                "skill": "reflection",
+                "tool": "StudyPlanValidator",
+                "backend": "Feasibility and coverage review",
+            },
+            "validate_plan": {
+                "agent": "StudyPlanAgent",
+                "skill": "artifact_validation",
+                "tool": "StudyPlanValidator",
+                "backend": "Time consistency and task coverage check",
+            },
+        }
+        return mapping.get(node, {"agent": "StudyPlanAgent"})
+
+    def _reflect_study_plan(
+        self,
+        *,
+        phases: list[dict[str, Any]],
+        tasks: list[dict[str, Any]],
+        subjects: dict[str, Any],
+        total_weeks: int,
+    ) -> dict[str, Any]:
+        missing_items: list[str] = []
+        if not phases:
+            missing_items.append("phases")
+        if not tasks:
+            missing_items.append("tasks")
+        if not subjects:
+            missing_items.append("subject_checklist")
+        status = "needs_revision" if missing_items else "ok"
+        return {
+            "status": status,
+            "missing_items": missing_items,
+            "next_action": "补齐阶段/任务/科目映射" if missing_items else "交给 validator 做硬约束检查",
+            "total_weeks": total_weeks,
+        }
+
+    def _validate_study_plan(
+        self,
+        *,
+        phases: list[dict[str, Any]],
+        tasks: list[dict[str, Any]],
+        subjects: dict[str, Any],
+        total_weeks: int,
+    ) -> dict[str, Any]:
+        issues: list[str] = []
+        if not phases:
+            issues.append("phases_empty")
+        if not tasks:
+            issues.append("tasks_empty")
+        if not subjects:
+            issues.append("subjects_empty")
+        if total_weeks <= 0:
+            issues.append("total_weeks_invalid")
+        passed = not issues
+        return {
+            "status": "completed" if passed else "partial",
+            "passed": passed,
+            "issues": issues,
+            "reason": "study plan validation passed" if passed else "study plan validation failed",
+        }

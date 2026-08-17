@@ -54,21 +54,37 @@ def test_build_analysis_strategy_prefers_history_first_when_history_is_rich() ->
                     "job_title": "综合管理岗",
                     "position_code": "BJ-001",
                     "history": {
-                        "summary": {
-                            "record_count": 3,
-                            "latest_recruit_count": 4,
-                            "latest_interview_ratio": 0.15,
-                            "recruit_count_trend": "downward",
-                            "interview_ratio_trend": "upward",
+                            "summary": {
+                                "record_count": 3,
+                                "latest_recruit_count": 4,
+                                "latest_interview_ratio": 0.15,
+                                "latest_interview_score": 72.5,
+                                "recruit_count_trend": "downward",
+                                "interview_ratio_trend": "upward",
+                            },
+                            "records": [
+                                {
+                                    "year": 2026,
+                                    "recruit_count": 4,
+                                    "interview_ratio": "1:6",
+                                    "interview_score": 72.5,
+                                },
+                                {
+                                    "year": 2025,
+                                    "recruit_count": 5,
+                                    "interview_ratio": "1:7",
+                                    "interview_score": 71.0,
+                                },
+                                {
+                                    "year": 2024,
+                                    "recruit_count": 6,
+                                    "interview_ratio": "1:8",
+                                    "interview_score": 69.5,
+                                },
+                            ],
                         },
-                        "records": [
-                            {"year": 2026, "recruit_count": 4, "interview_ratio": "1:6"},
-                            {"year": 2025, "recruit_count": 5, "interview_ratio": "1:7"},
-                            {"year": 2024, "recruit_count": 6, "interview_ratio": "1:8"},
-                        ],
-                    },
-                }
-            ],
+                    }
+                ],
             "recommendations": [],
         },
         policy_evidence=[{"doc_title": "招录公告", "content": "岗位公告原文"}],

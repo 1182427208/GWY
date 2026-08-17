@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import asyncio
 from dataclasses import dataclass
 from typing import Any
@@ -8,12 +9,14 @@ from urllib.parse import urlparse
 import httpx
 
 from app.core.config import settings
+from app.gwy.services.web_mcp_client import WebMCPClient
 
 
 @dataclass(slots=True)
 class PlaywrightMCPService:
     endpoint_url: str | None = None
     enabled: bool = True
+    web_mcp_enabled: bool = True
     timeout: float = 15.0
     http_client: Any | None = None
 
@@ -22,16 +25,57 @@ class PlaywrightMCPService:
             self.endpoint_url = str(settings.PLAYWRIGHT_MCP_URL)
         self.timeout = self.timeout or 15.0
 
-    def read(self, url: str) -> dict[str, Any]:
+    def read(
+        self,
+        url: str,
+        *,
+        selector: str = "body",
+        wait_ms: int = 800,
+        max_chars: int = 20_000,
+    ) -> dict[str, Any]:
         normalized_url = str(url or "").strip()
         if not self.enabled or not normalized_url:
             return {}
+
+        if self.web_mcp_enabled and settings.WEB_MCP_URL is not None:
+            mcp_result = WebMCPClient(endpoint_url=str(settings.WEB_MCP_URL)).read(
+                normalized_url,
+                selector=selector,
+                wait_ms=wait_ms,
+                max_chars=max_chars,
+            )
+            if mcp_result:
+                return self._normalize_result(
+                    url=normalized_url,
+                    final_url=_first_text(
+                        mcp_result.get("final_url"),
+                        mcp_result.get("url"),
+                    )
+                    or normalized_url,
+                    title=_first_text(mcp_result.get("title")),
+                    text=_first_text(mcp_result.get("text"), mcp_result.get("content"))
+                    or "",
+                    content_type=_first_text(mcp_result.get("content_type")),
+                    status_code=mcp_result.get("status_code"),
+                    source="playwright",
+                    retrieved_via=str(
+                        mcp_result.get("retrieved_via") or "web_mcp:browser_retrieve"
+                    ),
+                )
 
         mcp_result = self._read_via_mcp(normalized_url)
         if mcp_result:
             return mcp_result
 
-        return self._read_via_local_playwright(normalized_url)
+        try:
+            return self._read_via_local_playwright(
+                normalized_url,
+                selector=selector,
+                wait_ms=wait_ms,
+                max_chars=max_chars,
+            )
+        except TypeError:
+            return self._read_via_local_playwright(normalized_url)
 
     def _read_via_mcp(self, url: str) -> dict[str, Any]:
         endpoint = str(self.endpoint_url or "").strip()
@@ -125,20 +169,45 @@ class PlaywrightMCPService:
         url: str,
         tool_name: str,
     ) -> dict[str, Any]:
-        text = self._extract_mcp_text(getattr(result, "content", None))
-        if not text:
+        raw_text = self._extract_mcp_text(getattr(result, "content", None))
+        if not raw_text:
             return {}
 
-        title = _first_text(
-            getattr(result, "title", None),
-            getattr(result, "name", None),
-        )
+        payload = _parse_json_object(raw_text)
+        if isinstance(payload, dict):
+            if payload.get("ok") is False:
+                return {}
+
+            text = _first_text(payload.get("text"), payload.get("content"), raw_text)
+            title = _first_text(
+                payload.get("title"),
+                getattr(result, "title", None),
+                getattr(result, "name", None),
+            )
+            final_url = _first_text(
+                payload.get("final_url"),
+                payload.get("url"),
+                getattr(result, "url", None),
+            ) or url
+            content_type = _first_text(
+                payload.get("content_type"),
+                getattr(result, "content_type", None),
+            )
+        else:
+            text = raw_text
+            title = _first_text(
+                getattr(result, "title", None),
+                getattr(result, "name", None),
+            )
+            final_url = _first_text(getattr(result, "url", None)) or url
+            content_type = _first_text(getattr(result, "content_type", None))
+
         return self._normalize_result(
             url=url,
-            final_url=_first_text(getattr(result, "url", None)) or url,
+            final_url=final_url,
             title=title,
             text=text,
-            content_type=_first_text(getattr(result, "content_type", None)),
+            content_type=content_type,
             status_code=None,
             source="playwright",
             retrieved_via=f"playwright_mcp:{tool_name}",
@@ -184,7 +253,14 @@ class PlaywrightMCPService:
             headers["Host"] = "localhost:3000"
         return headers
 
-    def _read_via_local_playwright(self, url: str) -> dict[str, Any]:
+    def _read_via_local_playwright(
+        self,
+        url: str,
+        *,
+        selector: str = "body",
+        wait_ms: int = 800,
+        max_chars: int = 20_000,
+    ) -> dict[str, Any]:
         try:
             from playwright.sync_api import sync_playwright
         except Exception:
@@ -208,11 +284,14 @@ class PlaywrightMCPService:
                     except Exception:
                         pass
 
+                    if wait_ms > 0:
+                        page.wait_for_timeout(min(int(wait_ms), 10_000))
+
                     title = _first_text(page.title())
                     text = ""
                     try:
                         text = str(
-                            page.locator("body").inner_text(
+                            page.locator(selector or "body").inner_text(
                                 timeout=int(self.timeout * 1000)
                             )
                             or ""
@@ -224,7 +303,7 @@ class PlaywrightMCPService:
                         url=url,
                         final_url=str(page.url or url),
                         title=title,
-                        text=text,
+                        text=text[: max(1000, min(int(max_chars), 100_000))],
                         content_type="text/html",
                         status_code=None,
                         source="playwright",
@@ -274,3 +353,14 @@ def _first_text(*values: Any) -> str | None:
         if text:
             return text
     return None
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    candidate = str(text or "").strip()
+    if not candidate.startswith("{") or not candidate.endswith("}"):
+        return None
+    try:
+        payload = json.loads(candidate)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None

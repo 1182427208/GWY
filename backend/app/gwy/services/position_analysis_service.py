@@ -356,6 +356,7 @@ class PositionAnalysisService:
             else PositionSnapshotRuntimeService(
                 session=self.session,
                 chat_service=getattr(self.agent, "chat_service", None),
+                on_event=self._build_runtime_trace_callback(task_row),
             )
         )
         return runtime_service.run(
@@ -365,6 +366,34 @@ class PositionAnalysisService:
             user_profile=user_profile,
             recommendation_context=recommendation_context,
         )
+
+    def _build_runtime_trace_callback(
+        self,
+        task_row: GwyPositionAnalysisTask,
+    ) -> Callable[[dict[str, Any]], None]:
+        def record(event: dict[str, Any]) -> None:
+            task_row.trace_json = [
+                *list(task_row.trace_json or []),
+                self._normalize_runtime_trace_event(event),
+            ]
+            self.session.add(task_row)
+            self.session.commit()
+
+        return record
+
+    def _normalize_runtime_trace_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        step = str(event.get("step") or event.get("tool") or event.get("event") or "")
+        return {
+            "event": str(event.get("event") or ""),
+            "step": step,
+            "tool": event.get("tool"),
+            "status": str(event.get("status") or "done"),
+            "detail": str(event.get("detail") or ""),
+            "input": dict(event.get("input") or {}),
+            "output": dict(event.get("output") or {}),
+            "elapsed_ms": int(event.get("elapsed_ms") or 0),
+            "turn": event.get("turn"),
+        }
 
     def _build_study_plan_result(
         self,

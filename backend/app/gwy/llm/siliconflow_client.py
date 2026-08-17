@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 from collections.abc import Iterator, Sequence
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -23,7 +23,12 @@ class SiliconFlowClient:
         *,
         base_url: str | None = None,
         api_key: str | None = None,
+        chat_base_url: str | None = None,
+        chat_api_key: str | None = None,
         chat_model: str | None = None,
+        tool_chat_base_url: str | None = None,
+        tool_chat_api_key: str | None = None,
+        tool_chat_model: str | None = None,
         embedding_model: str | None = None,
         reranker_model: str | None = None,
         tts_model: str | None = None,
@@ -36,7 +41,24 @@ class SiliconFlowClient:
     ) -> None:
         self.base_url = (base_url or settings.SILICONFLOW_BASE_URL).rstrip("/")
         self.api_key = api_key if api_key is not None else settings.SILICONFLOW_API_KEY
-        self.chat_model = chat_model or settings.SILICONFLOW_CHAT_MODEL
+        self.chat_base_url = self._normalize_openai_base_url(
+            chat_base_url or settings.CHAT_BASE_URL or self.base_url
+        )
+        self.chat_api_key = (
+            chat_api_key if chat_api_key is not None else settings.CHAT_API_KEY
+        )
+        self.chat_model = chat_model or settings.CHAT_MODEL or settings.SILICONFLOW_CHAT_MODEL
+        self.tool_chat_base_url = self._normalize_openai_base_url(
+            tool_chat_base_url
+            or settings.TOOL_CHAT_BASE_URL
+            or self.chat_base_url
+        )
+        self.tool_chat_api_key = (
+            tool_chat_api_key
+            if tool_chat_api_key is not None
+            else settings.TOOL_CHAT_API_KEY or self.chat_api_key
+        )
+        self.tool_chat_model = tool_chat_model or settings.TOOL_CHAT_MODEL or self.chat_model
         self.embedding_model = embedding_model or settings.SILICONFLOW_EMBEDDING_MODEL
         self.reranker_model = reranker_model or settings.SILICONFLOW_RERANKER_MODEL
         self.tts_model = tts_model or settings.SILICONFLOW_TTS_MODEL
@@ -47,8 +69,13 @@ class SiliconFlowClient:
         self._client = client
         self._http_client = http_client
         self._openai_client = client or OpenAI(
-            api_key=self.api_key or "EMPTY",
-            base_url=self.base_url,
+            api_key=self.chat_api_key or "EMPTY",
+            base_url=self.chat_base_url,
+            timeout=self.timeout,
+        )
+        self._tool_openai_client = client or OpenAI(
+            api_key=self.tool_chat_api_key or "EMPTY",
+            base_url=self.tool_chat_base_url,
             timeout=self.timeout,
         )
 
@@ -127,6 +154,56 @@ class SiliconFlowClient:
         if last_error is not None:
             raise SiliconFlowError("SiliconFlow chat stream failed.") from last_error
         raise SiliconFlowError("SiliconFlow chat stream failed.")
+
+    def chat_completion_message(
+        self,
+        messages: Sequence[dict[str, Any]],
+        *,
+        tools: Sequence[dict[str, Any]] | None = None,
+        model: str | None = None,
+        temperature: float = 0.2,
+        max_tokens: int | None = None,
+        enable_thinking: bool | None = None,
+        thinking_budget: int | None = None,
+    ) -> dict[str, Any]:
+        """Return an OpenAI-compatible assistant message, including tool calls."""
+        last_error: Exception | None = None
+        for candidate_model in self._tool_chat_model_candidates(model):
+            try:
+                payload: dict[str, Any] = {
+                    "model": candidate_model,
+                    "messages": list(messages),
+                    "temperature": temperature,
+                    "extra_body": self._thinking_payload(
+                        candidate_model,
+                        enable_thinking=enable_thinking,
+                        thinking_budget=thinking_budget,
+                    ),
+                }
+                if max_tokens is not None:
+                    payload["max_tokens"] = max_tokens
+                if tools:
+                    payload["tools"] = list(tools)
+                    payload["tool_choice"] = "auto"
+                response = self._tool_chat_client().chat.completions.create(**payload)
+                choices = getattr(response, "choices", None) or []
+                if not choices:
+                    raise SiliconFlowError("SiliconFlow chat response is empty.")
+                return self._message_to_dict(
+                    choices[0].message,
+                    finish_reason=getattr(choices[0], "finish_reason", None),
+                )
+            except (BadRequestError, APIStatusError, SiliconFlowError) as exc:
+                last_error = exc
+                logger.debug(
+                    "SiliconFlow tool chat failed for model %s: %s",
+                    candidate_model,
+                    exc,
+                )
+                continue
+        if last_error is not None:
+            raise SiliconFlowError("SiliconFlow tool chat failed.") from last_error
+        raise SiliconFlowError("SiliconFlow tool chat failed.")
 
     def speech(
         self,
@@ -405,16 +482,25 @@ class SiliconFlowClient:
         normalized_path = path if path.startswith("/") else f"/{path}"
         return f"{self.base_url}{normalized_path}"
 
+    def _normalize_openai_base_url(self, url: str | None) -> str:
+        normalized = (url or self.base_url).rstrip("/")
+        if normalized in {"https://a6api.com", "http://a6api.com"}:
+            return f"{normalized}/v1"
+        return normalized
+
     def _chat_model_candidates(self, model: str | None) -> list[str]:
         primary = model or self.chat_model
-        fallback = "Qwen/Qwen3-VL-8B-Thinking"
-        candidates = [primary]
-        if fallback not in candidates:
-            candidates.append(fallback)
-        return candidates
+        return [primary]
+
+    def _tool_chat_model_candidates(self, model: str | None) -> list[str]:
+        primary = model or self.tool_chat_model
+        return [primary]
 
     def _chat_client(self) -> Any:
         return self._openai_client
+
+    def _tool_chat_client(self) -> Any:
+        return self._tool_openai_client
 
     def _thinking_payload(
         self,
@@ -471,3 +557,34 @@ class SiliconFlowClient:
         if content is None:
             return ""
         return str(content)
+
+    def _message_to_dict(
+        self,
+        message: Any,
+        *,
+        finish_reason: str | None = None,
+    ) -> dict[str, Any]:
+        result: dict[str, Any] = {
+            "role": "assistant",
+            "content": self._stringify_content(getattr(message, "content", None)),
+        }
+        if finish_reason:
+            result["finish_reason"] = finish_reason
+        tool_calls = getattr(message, "tool_calls", None) or []
+        if tool_calls:
+            result["tool_calls"] = []
+            for call in tool_calls:
+                function = getattr(call, "function", None)
+                result["tool_calls"].append(
+                    {
+                        "id": str(getattr(call, "id", "")),
+                        "type": str(getattr(call, "type", "function")),
+                        "function": {
+                            "name": str(getattr(function, "name", "")),
+                            "arguments": str(
+                                getattr(function, "arguments", "{}") or "{}"
+                            ),
+                        },
+                    }
+                )
+        return result

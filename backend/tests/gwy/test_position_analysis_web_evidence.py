@@ -298,3 +298,43 @@ def test_search_web_evidence_uses_browser_fallback_and_keeps_query_context() -> 
     assert "2026-001" in agent.web_search_service.queries[0]
     assert len(agent.web_search_service.queries) >= 2
     assert agent.web_search_service.queries[0] != agent.web_search_service.queries[1]
+
+
+def test_build_web_search_queries_prioritizes_competition_scores_when_missing() -> None:
+    agent = PositionAnalysisAgent(
+        session=None,
+        embedding_service=FakeEmbeddingService(),
+        rerank_service=FakeRerankService(),
+        milvus_store=FakeMilvusStore(),
+        web_search_service=RetryingWebSearchService(),
+        web_fetch_service=RecordingWebFetchService(),
+        browser_service=RecordingBrowserService(),
+        risk_review_agent=FakeRiskReviewAgent(),
+        report_generator_agent=FakeReportGeneratorAgent(),
+    )
+
+    queries = agent._build_web_search_queries(
+        position={
+            "department_name": "国家税务总局",
+            "office_name": "第一税务分局",
+            "job_title": "综合管理岗",
+            "position_code": "2026-001",
+        },
+        history_summary={
+            "record_count": 1,
+            "latest_recruit_count": 2,
+            "latest_interview_ratio": 45.0,
+            "latest_interview_score": None,
+        },
+        scope={
+            "analysis_goal": "岗位竞争证据补全",
+            "year": 2026,
+            "query": "国家税务总局 岗位分析",
+        },
+    )
+
+    assert any(
+        "进面分数" in query or "面试分数" in query or "进面名单" in query
+        for query in queries
+    )
+    assert any("报录比" in query for query in queries)

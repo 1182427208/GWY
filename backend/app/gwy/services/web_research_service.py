@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from app.core.config import settings
 from app.gwy.services.playwright_mcp_service import PlaywrightMCPService
 from app.gwy.services.web_fetch_service import WebFetchService
+from app.gwy.services.web_mcp_client import WebMCPClient
 from app.gwy.services.web_search_service import WebSearchService
 
 
@@ -79,12 +80,20 @@ class WebResearchService:
         search_service: Any | None = None,
         fetch_service: Any | None = None,
         browser_service: Any | None = None,
+        web_mcp_enabled: bool = True,
         max_results: int = 5,
         min_text_length: int | None = None,
     ) -> None:
-        self.search_service = search_service or WebSearchService()
-        self.fetch_service = fetch_service or WebFetchService()
-        self.browser_service = browser_service or PlaywrightMCPService()
+        self.web_mcp_enabled = web_mcp_enabled
+        self.search_service = search_service or WebSearchService(
+            web_mcp_enabled=web_mcp_enabled
+        )
+        self.fetch_service = fetch_service or WebFetchService(
+            web_mcp_enabled=web_mcp_enabled
+        )
+        self.browser_service = browser_service or PlaywrightMCPService(
+            web_mcp_enabled=web_mcp_enabled
+        )
         self.max_results = max(1, max_results)
         self.min_text_length = max(
             0,
@@ -94,6 +103,26 @@ class WebResearchService:
         )
 
     def verify(self, request: WebResearchRequest) -> WebResearchResult:
+        official_required = self._requires_official_evidence(request)
+        if self.web_mcp_enabled and settings.WEB_MCP_URL is not None:
+            remote_result = WebMCPClient(endpoint_url=str(settings.WEB_MCP_URL)).verify(
+                query=request.query,
+                planned_queries=list(request.planned_queries or []),
+                top_k=request.top_k,
+                seed_urls=list(request.seed_urls or []),
+            )
+            if remote_result:
+                result = self._build_remote_result(remote_result)
+                if official_required and not any(item.credibility == "high" for item in result.evidence):
+                    return WebResearchResult(
+                        evidence=[],
+                        failures=[*list(result.failures or []), {"reason": "official_evidence_required"}],
+                        trace=[*list(result.trace or []), {"step": "official_evidence_required", "status": "failed"}],
+                        attempts=list(result.attempts or []),
+                        insufficient_evidence=True,
+                    )
+                return result
+
         trace: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
         evidence: list[WebEvidence] = []
@@ -101,7 +130,18 @@ class WebResearchService:
         seen_urls: set[str] = set()
         started = time.perf_counter()
         queries = self._queries(request)
-        self._trace(trace, "web_query_planned", {"query_count": len(queries)})
+        if official_required:
+            queries = self._inject_official_query_variants(queries, request)
+        self._trace(
+            trace,
+            "web_query_planned",
+            {
+                "query_count": len(queries),
+                "official_required": official_required,
+            },
+            skill="web_query_planning",
+            tool="WebResearchService.verify",
+        )
 
         for query_index, query in enumerate(queries, start=1):
             query_attempts = [query]
@@ -112,7 +152,14 @@ class WebResearchService:
                 self._trace(
                     trace,
                     "web_search_started",
-                    {"query": current_query, "query_index": query_index, "attempt_index": attempt_index},
+                    {
+                        "query": current_query,
+                        "query_index": query_index,
+                        "attempt_index": attempt_index,
+                    },
+                    skill="web_search_planning",
+                    tool="WebSearchService.search",
+                    backend="SearXNG",
                 )
                 try:
                     hits = list(self.search_service.search(current_query, top_k=request.top_k) or [])
@@ -122,7 +169,14 @@ class WebResearchService:
                 self._trace(
                     trace,
                     "web_search_completed",
-                    {"query": current_query, "query_index": query_index, "attempt_index": attempt_index, "hit_count": len(hits)},
+                    {
+                        "query": current_query,
+                        "query_index": query_index,
+                        "attempt_index": attempt_index,
+                        "hit_count": len(hits),
+                    },
+                    tool="WebSearchService.search",
+                    backend="SearXNG",
                 )
 
                 fetched_count = 0
@@ -143,6 +197,7 @@ class WebResearchService:
                         query=current_query,
                         trace=trace,
                         failures=failures,
+                        official_required=official_required,
                     )
                     fetched_count += 1
                     browser_fallback_count += sum(
@@ -178,6 +233,7 @@ class WebResearchService:
                     query=request.query,
                     trace=trace,
                     failures=failures,
+                    official_required=official_required,
                 )
                 if item is not None:
                     evidence.append(item)
@@ -188,7 +244,14 @@ class WebResearchService:
             {
                 "citation_count": len(evidence),
                 "failure_count": len(failures),
-                "insufficient_evidence": not bool(evidence),
+                "official_required": official_required,
+                "official_citation_count": sum(
+                    1 for item in evidence if item.credibility == "high"
+                ),
+                "insufficient_evidence": (
+                    official_required
+                    and not any(item.credibility == "high" for item in evidence)
+                ) or not bool(evidence),
                 "duration_ms": int((time.perf_counter() - started) * 1000),
             },
         )
@@ -197,8 +260,94 @@ class WebResearchService:
             failures=failures,
             trace=trace,
             attempts=attempts,
-            insufficient_evidence=not bool(evidence),
+            insufficient_evidence=(
+                official_required
+                and not any(item.credibility == "high" for item in evidence)
+            )
+            or not bool(evidence),
         )
+
+    def _build_remote_result(self, payload: dict[str, Any]) -> WebResearchResult:
+        evidence: list[WebEvidence] = []
+        for item in list(payload.get("evidence") or []):
+            if not isinstance(item, dict):
+                continue
+            evidence.append(
+                WebEvidence(
+                    title=_first_text(item.get("title")),
+                    url=str(item.get("url") or ""),
+                    final_url=_first_text(item.get("final_url"), item.get("url")),
+                    source_domain=_first_text(item.get("source_domain")),
+                    published_at=_first_text(item.get("published_at")),
+                    retrieved_at=_first_text(item.get("retrieved_at")) or "",
+                    excerpt=_first_text(item.get("excerpt")) or "",
+                    evidence_type=_first_text(item.get("evidence_type")) or "web_page",
+                    credibility=_first_text(item.get("credibility")) or "medium",
+                    retrieved_via=_first_text(item.get("retrieved_via")) or "web_mcp",
+                    text=_first_text(item.get("text")) or "",
+                )
+            )
+
+        return WebResearchResult(
+            evidence=evidence,
+            failures=list(payload.get("failures") or []),
+            trace=list(payload.get("trace") or []),
+            attempts=list(payload.get("attempts") or []),
+            insufficient_evidence=bool(payload.get("insufficient_evidence", not evidence)),
+        )
+
+    def _requires_official_evidence(self, request: WebResearchRequest) -> bool:
+        query_text = " ".join([request.query, *list(request.planned_queries or [])]).lower()
+        keywords = (
+            "\u62a5\u5f55\u6bd4",
+            "\u8fdb\u9762",
+            "\u8fdb\u9762\u5206",
+            "\u8fdb\u9762\u4eba\u6570",
+            "\u9762\u8bd5\u540d\u5355",
+            "\u62db\u5f55\u4eba\u6570",
+            "\u5f55\u53d6\u6bd4\u4f8b",
+        )
+        return any(keyword in query_text for keyword in keywords)
+
+    def _inject_official_query_variants(
+        self,
+        queries: list[str],
+        request: WebResearchRequest,
+    ) -> list[str]:
+        position = dict(request.position or {})
+        position_label = " ".join(
+            part
+            for part in [
+                str(position.get("department_name") or "").strip(),
+                str(position.get("office_name") or "").strip(),
+                str(position.get("job_title") or "").strip(),
+                str(position.get("position_code") or "").strip(),
+            ]
+            if part
+        ).strip()
+        official_suffixes = [
+            "\u5b98\u7f51 \u516c\u544a",
+            "site:gov.cn",
+            "site:gov.cn \u516c\u544a",
+            "site:gov.cn \u62db\u5f55",
+            "site:gov.cn \u9762\u8bd5\u540d\u5355",
+            "site:gov.cn \u8fdb\u9762\u5206",
+        ]
+        variants: list[str] = []
+        seed = position_label or request.query
+        for query in queries:
+            if query not in variants:
+                variants.append(query)
+            for suffix in official_suffixes[:3]:
+                candidate = f"{query} {suffix}".strip()
+                if candidate not in variants:
+                    variants.append(candidate)
+        if seed:
+            for suffix in official_suffixes:
+                candidate = f"{seed} {suffix}".strip()
+                if candidate not in variants:
+                    variants.append(candidate)
+        return self._deduplicate_texts(variants)
 
     def _retry_query(self, query: str) -> str | None:
         normalized = str(query or "").strip()
@@ -213,8 +362,22 @@ class WebResearchService:
         query: str,
         trace: list[dict[str, Any]],
         failures: list[dict[str, Any]],
+        official_required: bool = False,
     ) -> WebEvidence | None:
         url = str(hit.get("url") or "").strip()
+        if official_required and not _is_official_domain(url):
+            failures.append({"url": url, "reason": "non_official_source_blocked"})
+            self._trace(
+                trace,
+                "web_official_source_rejected",
+                {
+                    "url": url,
+                    "reason": "non_official_source_blocked",
+                    "query": query,
+                },
+                skill="evidence_filtering",
+            )
+            return None
         self._trace(trace, "web_page_fetch_started", {"url": url, "query": query})
         try:
             fetched = dict(self.fetch_service.fetch(url) or {})
@@ -224,7 +387,12 @@ class WebResearchService:
         self._trace(
             trace,
             "web_page_fetch_completed",
-            {"url": url, "text_length": len(str(fetched.get("text") or ""))},
+            {
+                "url": url,
+                "text_length": len(str(fetched.get("text") or "")),
+            },
+            tool="WebFetchService.fetch",
+            backend="HTTP" if fetched.get("retrieved_via") == "http" else str(fetched.get("retrieved_via") or "fetch"),
         )
 
         browser_result: dict[str, Any] = {}
@@ -233,7 +401,17 @@ class WebResearchService:
             len(fetched_text) < self.min_text_length
             and not bool(fetched.get("is_pdf"))
         ):
-            self._trace(trace, "web_browser_fallback", {"url": url, "reason": "empty_or_short_http_text"})
+            self._trace(
+                trace,
+                "web_browser_fallback",
+                {
+                    "url": url,
+                    "reason": "empty_or_short_http_text",
+                },
+                tool="PlaywrightMCPService.read",
+                mcp_tool="read_page",
+                backend=str(getattr(self.browser_service, "endpoint_url", None) or "playwright_mcp"),
+            )
             try:
                 browser_result = dict(self.browser_service.read(url) or {})
             except Exception as exc:
@@ -277,7 +455,13 @@ class WebResearchService:
         self._trace(
             trace,
             "web_evidence_extracted",
-            {"url": url, "source_domain": evidence.source_domain, "text_length": len(content)},
+            {
+                "url": url,
+                "source_domain": evidence.source_domain,
+                "text_length": len(content),
+                "retrieved_via": evidence.retrieved_via,
+            },
+            skill="evidence_synthesis",
         )
         return evidence
 
@@ -296,8 +480,39 @@ class WebResearchService:
             key=lambda item: 0 if _is_official_domain(str(item.get("url") or "")) else 1,
         )
 
-    def _trace(self, trace: list[dict[str, Any]], step: str, output: dict[str, Any]) -> None:
-        trace.append({"step": step, "status": "done", "outputs_summary": output})
+    def _deduplicate_texts(self, values: list[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            item = str(value or "").strip()
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            result.append(item)
+        return result[: max(1, len(result))]
+
+    def _trace(
+        self,
+        trace: list[dict[str, Any]],
+        step: str,
+        output: dict[str, Any],
+        *,
+        skill: str | None = None,
+        tool: str | None = None,
+        backend: str | None = None,
+        mcp_tool: str | None = None,
+    ) -> None:
+        trace.append(
+            {
+                "step": step,
+                "status": "done",
+                "skill": skill,
+                "tool": tool,
+                "backend": backend,
+                "mcp_tool": mcp_tool,
+                "outputs_summary": output,
+            }
+        )
 
 
 def _is_safe_url(value: str) -> bool:

@@ -55,12 +55,23 @@ def test_snapshot_runtime_registers_position_tools() -> None:
 
     names = set(service._build_tool_registry().names())
 
+    assert "todo_tasks" in names
     assert "todo_write" in names
     assert "load_snapshot" in names
     assert "analyze_snapshot_positions" in names
+    assert "research_position_history" in names
+    assert "retrieve_position_policy_evidence" in names
+    assert "verify_position_hidden_requirements" in names
     assert "review_position_risks" in names
+    assert "build_position_decision_matrix" in names
+    assert "validate_report_requirements" in names
     assert "generate_study_plan" in names
     assert "compose_snapshot_report" in names
+    assert "web_search" in names
+    assert "web_fetch" in names
+    assert "browser_retrieve" in names
+    assert "list_tables" in names
+    assert "query_sql" in names
 
 
 class FakeCatalog:
@@ -84,7 +95,16 @@ class FakeStudy:
 
 
 class FakeReport:
-    def run(self, *, title, recommendations, risk_review):
+    def run(
+        self,
+        *,
+        title,
+        recommendations,
+        risk_review,
+        decision_matrix=None,
+        evidence_inventory=None,
+        verification_tasks=None,
+    ):
         return {
             "report": "# 深度岗位报告\n\n- 综合管理",
             "report_meta": {"used_llm": False},

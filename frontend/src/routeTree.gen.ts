@@ -19,6 +19,7 @@ import { Route as LayoutSettingsRouteImport } from './routes/_layout/settings'
 import { Route as LayoutItemsRouteImport } from './routes/_layout/items'
 import { Route as LayoutAdminRouteImport } from './routes/_layout/admin'
 import { Route as LayoutGwyPositionsRouteImport } from './routes/_layout/gwy/positions'
+import { Route as LayoutGwyEvalsRouteImport } from './routes/_layout/gwy/evals'
 import { Route as LayoutGwyChatRouteImport } from './routes/_layout/gwy/chat'
 import { Route as LayoutGwyAnalysisRouteImport } from './routes/_layout/gwy/analysis'
 
@@ -71,6 +72,11 @@ const LayoutGwyPositionsRoute = LayoutGwyPositionsRouteImport.update({
   path: '/gwy/positions',
   getParentRoute: () => LayoutRoute,
 } as any)
+const LayoutGwyEvalsRoute = LayoutGwyEvalsRouteImport.update({
+  id: '/gwy/evals',
+  path: '/gwy/evals',
+  getParentRoute: () => LayoutRoute,
+} as any)
 const LayoutGwyChatRoute = LayoutGwyChatRouteImport.update({
   id: '/gwy/chat',
   path: '/gwy/chat',
@@ -93,6 +99,7 @@ export interface FileRoutesByFullPath {
   '/settings': typeof LayoutSettingsRoute
   '/gwy/analysis': typeof LayoutGwyAnalysisRoute
   '/gwy/chat': typeof LayoutGwyChatRoute
+  '/gwy/evals': typeof LayoutGwyEvalsRoute
   '/gwy/positions': typeof LayoutGwyPositionsRoute
 }
 export interface FileRoutesByTo {
@@ -106,6 +113,7 @@ export interface FileRoutesByTo {
   '/': typeof LayoutIndexRoute
   '/gwy/analysis': typeof LayoutGwyAnalysisRoute
   '/gwy/chat': typeof LayoutGwyChatRoute
+  '/gwy/evals': typeof LayoutGwyEvalsRoute
   '/gwy/positions': typeof LayoutGwyPositionsRoute
 }
 export interface FileRoutesById {
@@ -121,6 +129,7 @@ export interface FileRoutesById {
   '/_layout/': typeof LayoutIndexRoute
   '/_layout/gwy/analysis': typeof LayoutGwyAnalysisRoute
   '/_layout/gwy/chat': typeof LayoutGwyChatRoute
+  '/_layout/gwy/evals': typeof LayoutGwyEvalsRoute
   '/_layout/gwy/positions': typeof LayoutGwyPositionsRoute
 }
 export interface FileRouteTypes {
@@ -136,6 +145,7 @@ export interface FileRouteTypes {
     | '/settings'
     | '/gwy/analysis'
     | '/gwy/chat'
+    | '/gwy/evals'
     | '/gwy/positions'
   fileRoutesByTo: FileRoutesByTo
   to:
@@ -149,6 +159,7 @@ export interface FileRouteTypes {
     | '/'
     | '/gwy/analysis'
     | '/gwy/chat'
+    | '/gwy/evals'
     | '/gwy/positions'
   id:
     | '__root__'
@@ -163,6 +174,7 @@ export interface FileRouteTypes {
     | '/_layout/'
     | '/_layout/gwy/analysis'
     | '/_layout/gwy/chat'
+    | '/_layout/gwy/evals'
     | '/_layout/gwy/positions'
   fileRoutesById: FileRoutesById
 }
@@ -246,6 +258,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof LayoutGwyPositionsRouteImport
       parentRoute: typeof LayoutRoute
     }
+    '/_layout/gwy/evals': {
+      id: '/_layout/gwy/evals'
+      path: '/gwy/evals'
+      fullPath: '/gwy/evals'
+      preLoaderRoute: typeof LayoutGwyEvalsRouteImport
+      parentRoute: typeof LayoutRoute
+    }
     '/_layout/gwy/chat': {
       id: '/_layout/gwy/chat'
       path: '/gwy/chat'
@@ -270,6 +289,7 @@ interface LayoutRouteChildren {
   LayoutIndexRoute: typeof LayoutIndexRoute
   LayoutGwyAnalysisRoute: typeof LayoutGwyAnalysisRoute
   LayoutGwyChatRoute: typeof LayoutGwyChatRoute
+  LayoutGwyEvalsRoute: typeof LayoutGwyEvalsRoute
   LayoutGwyPositionsRoute: typeof LayoutGwyPositionsRoute
 }
 
@@ -280,6 +300,7 @@ const LayoutRouteChildren: LayoutRouteChildren = {
   LayoutIndexRoute: LayoutIndexRoute,
   LayoutGwyAnalysisRoute: LayoutGwyAnalysisRoute,
   LayoutGwyChatRoute: LayoutGwyChatRoute,
+  LayoutGwyEvalsRoute: LayoutGwyEvalsRoute,
   LayoutGwyPositionsRoute: LayoutGwyPositionsRoute,
 }
 

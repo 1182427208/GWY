@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 import httpx
 
 from app.core.config import settings
+from app.gwy.services.web_mcp_client import WebMCPClient
 
 
 @dataclass(slots=True)
@@ -24,12 +25,14 @@ class WebSearchService:
         self,
         *,
         enabled: bool | None = None,
+        web_mcp_enabled: bool = True,
         base_url: str | None = None,
         timeout: float | None = None,
         language: str | None = None,
         http_client: Any | None = None,
     ) -> None:
         self.enabled = settings.WEB_SEARCH_ENABLED if enabled is None else enabled
+        self.web_mcp_enabled = web_mcp_enabled
         self.base_url = (base_url or settings.SEARXNG_BASE_URL).rstrip("/")
         self.timeout = timeout or settings.SEARXNG_TIMEOUT_SECONDS
         self.language = language or settings.SEARXNG_LANGUAGE
@@ -41,6 +44,14 @@ class WebSearchService:
             return []
 
         limit = max(1, top_k or settings.SEARXNG_TOP_K)
+        if self.web_mcp_enabled and settings.WEB_MCP_URL is not None:
+            mcp_result = WebMCPClient(endpoint_url=str(settings.WEB_MCP_URL)).search(
+                normalized_query,
+                top_k=limit,
+            )
+            results = list(mcp_result.get("results") or [])
+            if results:
+                return results[:limit]
         try:
             response = self._get_search_response(normalized_query)
             response.raise_for_status()

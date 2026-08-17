@@ -19,6 +19,7 @@
     "noFallthroughCasesInSwitch": true,
     "baseUrl": ".",
     "paths": {
+      "@/client": ["./src/client/index.ts"],
       "@/*": ["./src/*"]
     }
   },

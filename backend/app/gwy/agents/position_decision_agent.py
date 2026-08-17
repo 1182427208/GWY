@@ -129,6 +129,9 @@ class PositionDecisionAgent:
         trace.append(
             {
                 "step": "position_intent_analysis",
+                "agent": "PositionDecisionAgent",
+                "skill": "extract_position_recommendation_criteria",
+                "tool": "position_recommendation_parser",
                 "missing_fields": list(criteria.missing_fields),
                 "strict_region": bool(criteria.strict_region),
                 "major": criteria.major,
@@ -281,6 +284,9 @@ class PositionDecisionAgent:
         trace.append(
             {
                 "step": "position_candidate_load",
+                "agent": "PositionDecisionAgent",
+                "tool": "PostgreSQL",
+                "backend": "sqlmodel_session.exec",
                 "candidate_count": len(candidates),
                 "sql_filtered": used_sql_filter,
                 "sql_filter_count": len(sql_filters),
@@ -350,6 +356,8 @@ class PositionDecisionAgent:
         trace.append(
             {
                 "step": "position_filter_and_rank",
+                "agent": "PositionDecisionAgent",
+                "skill": "position_passes_hard_filters / score_position",
                 "candidate_count": len(candidates),
                 "exact_match_count": len(exact_matches),
                 "relaxed_match_count": len(relaxed_matches),
@@ -375,6 +383,9 @@ class PositionDecisionAgent:
             trace.append(
                 {
                     "step": "position_persist",
+                    "agent": "PositionDecisionAgent",
+                    "tool": "GwyRecommendationTask",
+                    "backend": "sqlmodel_session.commit",
                     "task_id": None,
                     "item_count": len(state.get("recommendations") or []),
                     "status": "skipped",
@@ -419,6 +430,9 @@ class PositionDecisionAgent:
         trace.append(
             {
                 "step": "position_persist",
+                "agent": "PositionDecisionAgent",
+                "tool": "GwyRecommendationTask",
+                "backend": "sqlmodel_session.commit",
                 "task_id": str(task.id),
                 "item_count": len(state.get("recommendations") or []),
             }
@@ -436,6 +450,8 @@ class PositionDecisionAgent:
         trace.append(
             {
                 "step": "position_answer_generation",
+                "agent": "PositionDecisionAgent",
+                "skill": "build_position_brief / build_recommendation_summary",
                 "used_llm": False,
                 "recommendation_count": len(recommendations),
             }

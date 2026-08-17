@@ -15,8 +15,9 @@ from __future__ import annotations
 import json
 import logging
 import re
+from datetime import datetime, timezone
 from typing import Any
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from sqlmodel import Session, select
 
@@ -35,6 +36,7 @@ _MK_USER_PREFERENCES = "user_preferences"
 _MK_ANALYSIS_PROGRESS = "analysis_progress"
 _MK_LAST_RECOMMENDATIONS = "last_recommendations"
 _MK_TASK_CONTEXT = "task_context"
+_MK_COMPACT_SUMMARY = "compact_summary"
 
 # Build regex patterns at module load time to avoid source encoding issues
 def _build_preference_patterns():
@@ -156,6 +158,67 @@ class AgentMemoryService:
     def save_task_context(self, context: dict[str, Any]) -> None:
         self.set_working_memory(_MK_TASK_CONTEXT, context)
 
+    def save_compact_transcript(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        focus: str = "",
+    ) -> dict[str, Any]:
+        transcript_id = uuid4().hex
+        now = datetime.now(timezone.utc).isoformat()
+        value = {
+            "transcript_id": transcript_id,
+            "conversation_id": self.conversation_id,
+            "user_id": str(self.user_id) if self.user_id else None,
+            "focus": focus,
+            "messages": messages,
+            "message_count": len(messages),
+            "created_at": now,
+        }
+        key = f"compact_transcript:{transcript_id}"
+        if self.conversation_id is not None:
+            self._upsert_pg_memory(key, value)
+        if self.redis:
+            try:
+                self.redis.setex(
+                    f"gwy:compact:transcript:{self.conversation_id or 'global'}:{transcript_id}",
+                    _SHORT_TERM_TTL_SECONDS,
+                    json.dumps(value, ensure_ascii=False, default=str),
+                )
+            except Exception:
+                logger.warning("Redis compact transcript save failed for id=%s", transcript_id)
+        return {
+            "transcript_id": transcript_id,
+            "conversation_id": self.conversation_id,
+            "message_count": len(messages),
+            "focus": focus,
+        }
+
+    def save_compact_summary(
+        self,
+        summary: str,
+        *,
+        transcript_id: str,
+        focus: str = "",
+    ) -> None:
+        value = {
+            "summary": summary,
+            "transcript_id": transcript_id,
+            "focus": focus,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if self.conversation_id is not None:
+            self._upsert_pg_memory(_MK_COMPACT_SUMMARY, value)
+        if self.redis:
+            try:
+                self.redis.setex(
+                    f"gwy:compact:summary:{self.conversation_id or 'global'}",
+                    _SHORT_TERM_TTL_SECONDS,
+                    json.dumps(value, ensure_ascii=False, default=str),
+                )
+            except Exception:
+                logger.warning("Redis compact summary save failed for id=%s", transcript_id)
+
     def extract_preferences_from_message(self, user_message: str) -> dict[str, Any]:
         extracted: dict[str, Any] = {}
         for field, pattern in _PREFERENCE_PATTERNS:
@@ -174,6 +237,120 @@ class AgentMemoryService:
 
     def get_extracted_preferences(self) -> dict[str, Any]:
         return self.get_working_memory(_MK_USER_PREFERENCES) or {}
+
+    def build_memory_catalog(self, max_items: int = 200) -> list[dict[str, Any]]:
+        """Build lightweight cards for side-query selection."""
+        cards: list[dict[str, Any]] = []
+
+        preferences = self.get_extracted_preferences()
+        if preferences:
+            cards.append(
+                {
+                    "name": "session-preferences",
+                    "description": "当前会话中用户明确表达的个人偏好。",
+                    "type": "user",
+                    "scope": "session",
+                    "content": json.dumps(
+                        preferences,
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                }
+            )
+
+        long_term = self.get_long_term_context()
+        user_profile = dict(long_term.get("user_profile") or {})
+        if user_profile:
+            cards.append(
+                {
+                    "name": "user-profile",
+                    "description": "用户的学历、专业、政治面貌、地区和岗位偏好。",
+                    "type": "user",
+                    "scope": "user",
+                    "content": json.dumps(
+                        user_profile,
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                }
+            )
+
+        for key, title, description in (
+            (
+                _MK_ANALYSIS_PROGRESS,
+                "当前任务的分析进度和阶段。",
+                "session-analysis-progress",
+            ),
+            (
+                _MK_TASK_CONTEXT,
+                "当前岗位分析或规划任务的上下文。",
+                "session-task-context",
+            ),
+            (
+                _MK_LAST_RECOMMENDATIONS,
+                "最近一次岗位推荐结果。",
+                "recent-position-recommendations",
+            ),
+            (
+                _MK_COMPACT_SUMMARY,
+                "上下文压缩后保存的连续性摘要。",
+                "compact-conversation-summary",
+            ),
+        ):
+            value = self.get_working_memory(key)
+            if value:
+                cards.append(
+                    {
+                        "name": title,
+                        "description": description,
+                        "type": "session",
+                        "scope": "conversation",
+                        "content": json.dumps(
+                            value,
+                            ensure_ascii=False,
+                            default=str,
+                        ),
+                    }
+                )
+
+        if long_term.get("recent_liked") or long_term.get("recent_disliked"):
+            cards.append(
+                {
+                    "name": "position-decisions",
+                    "description": "用户近期喜欢或不喜欢的岗位决策记录。",
+                    "type": "feedback",
+                    "scope": "user",
+                    "content": json.dumps(
+                        {
+                            "liked": long_term.get("recent_liked") or [],
+                            "disliked": long_term.get("recent_disliked") or [],
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                }
+            )
+
+        if long_term.get("historical_task_count"):
+            cards.append(
+                {
+                    "name": "position-analysis-history",
+                    "description": "用户历史岗位分析次数和相关行为摘要。",
+                    "type": "project",
+                    "scope": "user",
+                    "content": json.dumps(
+                        {
+                            "task_count": long_term.get("historical_task_count"),
+                            "liked_count": long_term.get("liked_positions_count"),
+                            "disliked_count": long_term.get("disliked_positions_count"),
+                        },
+                        ensure_ascii=False,
+                        default=str,
+                    ),
+                }
+            )
+
+        return cards[:max_items]
 
     def get_long_term_context(self) -> dict[str, Any]:
         if self.user_id is None:

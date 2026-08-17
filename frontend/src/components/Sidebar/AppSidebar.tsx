@@ -1,4 +1,5 @@
 import {
+  BarChart3,
   Briefcase,
   FileText,
   Home,
@@ -24,18 +25,23 @@ const baseItems: Item[] = [
   { icon: MessageSquareText, title: "政策对话", path: "/gwy/chat" },
   { icon: Briefcase, title: "岗位推荐", path: "/gwy/positions" },
   { icon: FileText, title: "岗位分析", path: "/gwy/analysis" },
+  { icon: BarChart3, title: "评测分析", path: "/gwy/evals" },
 ]
 
 export function AppSidebar() {
   const { user: currentUser } = useAuth()
-
+  const evaluationItem = baseItems[baseItems.length - 1]
   const items = currentUser?.is_superuser
-    ? [...baseItems, { icon: Users, title: "Admin", path: "/admin" }]
+    ? [
+        ...baseItems.slice(0, -1),
+        { icon: Users, title: "Admin", path: "/admin" },
+        evaluationItem,
+      ]
     : baseItems
 
   return (
     <Sidebar collapsible="icon">
-      <SidebarHeader className="px-4 py-6 group-data-[collapsible=icon]:px-0 group-data-[collapsible=icon]:items-center">
+      <SidebarHeader className="px-4 py-6 group-data-[collapsible=icon]:items-center group-data-[collapsible=icon]:px-0">
         <Logo variant="responsive" />
       </SidebarHeader>
       <SidebarContent>

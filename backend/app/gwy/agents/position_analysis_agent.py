@@ -41,7 +41,6 @@ from app.gwy.skills.position_analysis_skills import (
 )
 from app.gwy.vectorstores.milvus_store import MilvusPolicyStore
 
-
 POSITION_STRATEGY_PLANNER_SYSTEM_PROMPT = """
 你是 GwyPilot 的岗位分析规划器。
 
@@ -179,7 +178,7 @@ class PositionAnalysisAgent:
         builder.add_node("retry_research", self._node_retry_research)
         builder.add_node("decide_report_focus", self._node_decide_report_focus)
         builder.add_node("retrieve_policy_evidence", self._node_retrieve_policy_evidence)
-        builder.add_node("risk_review", self._node_risk_review)
+        builder.add_node("risk_review_eval", self._node_risk_review)
         builder.add_node("compose_report", self._node_compose_report)
         builder.add_node("refine_report", self._node_refine_report)
         builder.add_node("persist_result", self._node_persist_result)
@@ -209,8 +208,8 @@ class PositionAnalysisAgent:
             },
         )
         builder.add_edge("retry_research", "decide_report_focus")
-        builder.add_edge("decide_report_focus", "risk_review")
-        builder.add_edge("risk_review", "compose_report")
+        builder.add_edge("decide_report_focus", "risk_review_eval")
+        builder.add_edge("risk_review_eval", "compose_report")
         builder.add_edge("compose_report", "refine_report")
         builder.add_edge("refine_report", "persist_result")
         builder.add_edge("persist_result", END)
@@ -1956,6 +1955,9 @@ class PositionAnalysisAgent:
         position_code = str(position.get("position_code") or "").strip()
         year = str(scope.get("year") or "").strip()
         scope_query = str(scope.get("query") or "").strip()
+        competition_terms = ["招录人数", "报录比"]
+        if history_summary.get("latest_interview_score") is None:
+            competition_terms.extend(["进面分数", "面试分数", "进面名单"])
         queries = [
             " ".join(
                 part
@@ -1975,9 +1977,7 @@ class PositionAnalysisAgent:
                     office_name,
                     job_title,
                     position_code,
-                    "鍘嗗勾",
-                    "鎷涘綍浜烘暟",
-                    "报录比",
+                    *competition_terms,
                 ]
                 if part
             ).strip(),
@@ -1988,7 +1988,7 @@ class PositionAnalysisAgent:
                     job_title,
                     year,
                     "招考简章",
-                    "鎷涘綍浜烘暟",
+                    *competition_terms,
                 ]
                 if part
             ).strip(),
@@ -2002,7 +2002,7 @@ class PositionAnalysisAgent:
                         office_name,
                         job_title,
                         "报录比",
-                        "瀹樻柟鍏憡",
+                        "进面分数",
                     ]
                     if part
                 ).strip()
@@ -2045,6 +2045,8 @@ class PositionAnalysisAgent:
                 missing_fields.append("recruit_count")
             if self._is_missing_interview_ratio(record):
                 missing_fields.append("interview_ratio")
+            if self._is_missing_interview_score(record):
+                missing_fields.append("interview_score")
 
             for missing_field in missing_fields:
                 key = f"{year_text}:{missing_field}"
@@ -2062,7 +2064,9 @@ class PositionAnalysisAgent:
                             missing_field=missing_field,
                         ),
                         "focus": self._missing_field_focus(missing_field, year_text),
-                        "priority": "high" if missing_field == "interview_ratio" else "medium",
+                        "priority": "high"
+                        if missing_field in {"interview_ratio", "interview_score"}
+                        else "medium",
                     }
                 )
 
@@ -2391,6 +2395,15 @@ class PositionAnalysisAgent:
 
     def _is_missing_interview_ratio(self, record: dict[str, Any]) -> bool:
         value = record.get("interview_ratio")
+        if value is None:
+            return True
+        text = str(value).strip()
+        if text in {"", "-", "--", "缺失", "未知", "暂无"}:
+            return True
+        return not bool(re.search(r"\\d", text))
+
+    def _is_missing_interview_score(self, record: dict[str, Any]) -> bool:
+        value = record.get("interview_score")
         if value is None:
             return True
         text = str(value).strip()
@@ -3998,7 +4011,7 @@ class PositionAnalysisAgent:
         evidence_refs: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         elapsed_ms = int(round((time.perf_counter() - started_at) * 1000))
-        return {
+        payload = {
             "step": step,
             "status": status,
             "detail": detail,
@@ -4007,6 +4020,90 @@ class PositionAnalysisAgent:
             "outputs_summary": outputs_summary or {},
             "evidence_refs": evidence_refs or [],
         }
+        payload.update(self._trace_context(step))
+        return payload
+
+    def _trace_context(self, step: str) -> dict[str, Any]:
+        mapping = {
+            "load_snapshot": {
+                "agent": "PositionAnalysisAgent",
+                "skill": "load_snapshot",
+                "tool": "PostgreSQL",
+                "backend": "sqlmodel_session.get",
+            },
+            "normalize_snapshot": {
+                "agent": "PositionAnalysisAgent",
+                "skill": "normalize_analysis_snapshot",
+            },
+            "ingest_recommendation_context": {
+                "agent": "PositionAnalysisAgent",
+                "skill": "ingest_recommendation_context",
+            },
+            "build_analysis_scope": {
+                "agent": "PositionAnalysisAgent",
+                "skill": "build_analysis_scope",
+            },
+            "clarify_requirements": {
+                "agent": "PositionAnalysisAgent",
+                "skill": "completion_criteria",
+            },
+            "retrieve_position_facts": {
+                "agent": "PositionAnalysisAgent",
+                "tool": "PositionCatalogService",
+                "backend": "PostgreSQL",
+                "skill": "structured_position_filtering",
+            },
+            "retrieve_policy_evidence": {
+                "agent": "PositionAnalysisAgent",
+                "tool": "PolicyEvidenceAgent",
+                "backend": "Milvus + RerankService",
+                "skill": "policy_evidence_react",
+            },
+            "plan_analysis_strategy": {
+                "agent": "PositionAnalysisAgent",
+                "skill": "plan_and_execute",
+            },
+            "research_positions": {
+                "agent": "PositionAnalysisAgent",
+                "tool": "WebVerificationAgent",
+                "backend": "SearXNG + HTTP fetch + Playwright MCP",
+                "skill": "react_research",
+            },
+            "observe_research_gaps": {
+                "agent": "PositionAnalysisAgent",
+                "skill": "reflection",
+            },
+            "retry_research": {
+                "agent": "PositionAnalysisAgent",
+                "skill": "replan",
+            },
+            "decide_report_focus": {
+                "agent": "PositionAnalysisAgent",
+                "skill": "completion_criteria",
+            },
+            "risk_review": {
+                "agent": "PositionAnalysisAgent",
+                "tool": "RiskReviewAgent",
+                "backend": "Milvus + RerankService",
+                "skill": "react_reflection",
+            },
+            "compose_report": {
+                "agent": "PositionAnalysisAgent",
+                "tool": "ReportGeneratorAgent",
+                "skill": "report_synthesis",
+            },
+            "refine_report": {
+                "agent": "PositionAnalysisAgent",
+                "skill": "reflection",
+            },
+            "persist_result": {
+                "agent": "PositionAnalysisAgent",
+                "tool": "SQLModel",
+                "backend": "postgresql",
+                "skill": "artifact_persistence",
+            },
+        }
+        return mapping.get(step, {"agent": "PositionAnalysisAgent"})
 
     def _trace_brief(self, item: dict[str, Any]) -> dict[str, Any]:
         return {

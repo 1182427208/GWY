@@ -216,6 +216,7 @@ function GwyPositionsPage() {
     "请结合我当前筛选出的岗位，给出推荐顺序、匹配原因和风险提示。",
   )
   const [analysisLoading, setAnalysisLoading] = useState(false)
+  const [evaluationEnabled, setEvaluationEnabled] = useState(false)
   const [analysisError, setAnalysisError] = useState<string | null>(null)
   const [analysisResult, setAnalysisResult] =
     useState<PositionAnalyzeResponse | null>(null)
@@ -364,6 +365,7 @@ function GwyPositionsPage() {
           selectedIds: Array.from(selectedIds),
           filters: appliedFilters,
           selectionRows: selectionSummary,
+          enableEvaluation: evaluationEnabled,
         }),
       })
       setAnalysisResult(null)
@@ -736,6 +738,15 @@ function GwyPositionsPage() {
                 placeholder="例如：我更看重北京、稳定、工学硕士、党员要求。"
               />
               <div className="flex gap-2">
+                <label className="inline-flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 text-xs text-amber-800">
+                  <Checkbox
+                    checked={evaluationEnabled}
+                    onCheckedChange={(checked) =>
+                      setEvaluationEnabled(checked === true)
+                    }
+                  />
+                  评测分析
+                </label>
                 <Button
                   onClick={() => {
                     void analyzeSelected()
@@ -852,11 +863,13 @@ function buildAnalysisTaskRequest({
   selectedIds,
   filters,
   selectionRows,
+  enableEvaluation,
 }: {
   query: string
   selectedIds: string[]
   filters: PositionFilters
   selectionRows: PositionRow[]
+  enableEvaluation: boolean
 }) {
   const visibleColumns = [
     "department_name",
@@ -899,6 +912,7 @@ function buildAnalysisTaskRequest({
       visible_columns: visibleColumns,
       selected_row_samples: selectionRows.slice(0, 20),
     },
+    enable_evaluation: enableEvaluation,
   }
 }
 

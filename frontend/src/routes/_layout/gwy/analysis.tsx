@@ -46,12 +46,17 @@ type AnalysisEvidence = {
 }
 
 type AnalysisTraceEntry = {
+  event: string
   step: string
+  tool?: string
   status: string
   detail: string
   elapsed_ms: number
+  turn?: number
   inputs_summary: Record<string, unknown>
   outputs_summary: Record<string, unknown>
+  raw_input: Record<string, unknown>
+  raw_output: Record<string, unknown>
   evidence_refs: AnalysisEvidence[]
   query?: string
   query_index?: number
@@ -313,6 +318,10 @@ function GwyAnalysisPage() {
   }, [taskId])
 
   const taskOutput = (task?.output_json ?? {}) as Record<string, unknown>
+  const runtimeState = isRecord(taskOutput.runtime_state)
+    ? (taskOutput.runtime_state as Record<string, unknown>)
+    : {}
+  const analysisOutput = { ...runtimeState, ...taskOutput }
   const reportText = task?.report_text?.trim() ?? ""
   const traceEntries = useMemo(
     () => normalizeTraceEntries(task?.trace_json),
@@ -323,39 +332,41 @@ function GwyAnalysisPage() {
     [traceEntries],
   )
   const evidence = useMemo(() => {
-    const rawEvidence = taskOutput.policy_evidence
+    const rawEvidence = analysisOutput.policy_evidence
     if (!Array.isArray(rawEvidence)) {
       return []
     }
     return rawEvidence
       .map((item) => normalizeEvidence(item))
       .filter((item): item is AnalysisEvidence => item !== null)
-  }, [taskOutput])
+  }, [analysisOutput])
 
   const reportOutline = useMemo(() => {
-    const rawOutline = taskOutput.report_outline
+    const rawOutline = analysisOutput.report_outline
     return Array.isArray(rawOutline)
       ? rawOutline.map((item) => String(item)).filter(Boolean)
       : []
-  }, [taskOutput])
+  }, [analysisOutput])
 
-  const analysisMeta = isRecord(taskOutput.analysis_meta)
-    ? (taskOutput.analysis_meta as Record<string, unknown>)
+  const analysisMeta = isRecord(analysisOutput.analysis_meta)
+    ? (analysisOutput.analysis_meta as Record<string, unknown>)
+    : isRecord(analysisOutput.report_meta)
+      ? (analysisOutput.report_meta as Record<string, unknown>)
+      : {}
+  const positionFacts = isRecord(analysisOutput.position_facts)
+    ? (analysisOutput.position_facts as Record<string, unknown>)
     : {}
-  const positionFacts = isRecord(taskOutput.position_facts)
-    ? (taskOutput.position_facts as Record<string, unknown>)
-    : {}
-  const analysisStrategy = isRecord(taskOutput.analysis_strategy)
-    ? normalizeAnalysisStrategy(taskOutput.analysis_strategy)
+  const analysisStrategy = isRecord(analysisOutput.analysis_strategy)
+    ? normalizeAnalysisStrategy(analysisOutput.analysis_strategy)
     : null
-  const analysisDecision = isRecord(taskOutput.analysis_decision)
-    ? (taskOutput.analysis_decision as AnalysisDecision)
+  const analysisDecision = isRecord(analysisOutput.analysis_decision)
+    ? (analysisOutput.analysis_decision as AnalysisDecision)
     : {}
-  const recommendationContext = isRecord(taskOutput.recommendation_context)
-    ? (taskOutput.recommendation_context as AnalysisRecommendationContext)
+  const recommendationContext = isRecord(analysisOutput.recommendation_context)
+    ? (analysisOutput.recommendation_context as AnalysisRecommendationContext)
     : {}
-  const feishuPush = isRecord(taskOutput.feishu_push)
-    ? (taskOutput.feishu_push as Record<string, unknown>)
+  const feishuPush = isRecord(analysisOutput.feishu_push)
+    ? (analysisOutput.feishu_push as Record<string, unknown>)
     : {}
   const analysisDecisionFocusPositions = Array.isArray(
     analysisDecision.focus_positions,
@@ -368,8 +379,8 @@ function GwyAnalysisPage() {
         .filter(Boolean)
     : []
   const studyPlan = useMemo(
-    () => normalizeStudyPlan(taskOutput.study_plan),
-    [taskOutput],
+    () => normalizeStudyPlan(analysisOutput.study_plan),
+    [analysisOutput],
   )
   const analysisSearchCoverage = (analysisDecision.search_coverage ?? {}) as {
     with_web_evidence?: number
@@ -390,13 +401,13 @@ function GwyAnalysisPage() {
   const agentJourney = useMemo(
     () =>
       normalizeJourneyEntries(
-        taskOutput.analysis_journey ?? taskOutput.agent_journey,
+        analysisOutput.analysis_journey ?? analysisOutput.agent_journey,
       ),
-    [taskOutput],
+    [analysisOutput],
   )
   const positionResearches = useMemo(
-    () => normalizePositionResearches(taskOutput.position_researches),
-    [taskOutput],
+    () => normalizePositionResearches(analysisOutput.position_researches),
+    [analysisOutput],
   )
   const selectedPositionFacts = useMemo(
     () => normalizePositionFacts(positionFacts.selected_positions),
@@ -421,9 +432,10 @@ function GwyAnalysisPage() {
   const snapshotColumns = snapshot?.visible_columns ?? []
   const snapshotSelected = snapshot?.selected_position_ids ?? []
   const isClarification =
-    task?.status === "needs_more_info" || Boolean(taskOutput.needs_more_info)
-  const clarifyingQuestions = toStringList(taskOutput.clarifying_questions)
-  const missingFields = toStringList(taskOutput.missing_fields)
+    task?.status === "needs_more_info" ||
+    Boolean(analysisOutput.needs_more_info)
+  const clarifyingQuestions = toStringList(analysisOutput.clarifying_questions)
+  const missingFields = toStringList(analysisOutput.missing_fields)
   const taskInput = isRecord(task?.input_json)
     ? (task?.input_json as Record<string, unknown>)
     : {}
@@ -1820,7 +1832,8 @@ function GwyAnalysisPage() {
                             ?.split("\n")
                             .map((line) => line.trim())
                             .find(
-                              (line) => line.length > 0 && !line.startsWith("#"),
+                              (line) =>
+                                line.length > 0 && !line.startsWith("#"),
                             ) || "暂无分析摘要"
                         const firstQuery = String(
                           item.web_search_attempts[0]?.query ||
@@ -2004,7 +2017,8 @@ function GwyAnalysisPage() {
                           缺口 / 搜索目标 / 搜索结果
                         </div>
                         <div className="mt-1 text-xs text-slate-500">
-                          这部分只展示每个岗位真正缺了什么、Agent 具体搜了什么、最后拿到了什么证据。
+                          这部分只展示每个岗位真正缺了什么、Agent
+                          具体搜了什么、最后拿到了什么证据。
                         </div>
                       </div>
                       <Badge variant="outline" className="bg-white">
@@ -2014,7 +2028,8 @@ function GwyAnalysisPage() {
                     <div className="mt-3 space-y-3">
                       {positionResearches.slice(0, 5).map((item) => {
                         const focusItem =
-                          analysisDecisionFocusById.get(item.position_id) || null
+                          analysisDecisionFocusById.get(item.position_id) ||
+                          null
                         const strategyTarget = item.strategy_target
                         const gapLabels = toStringList(focusItem?.gaps)
                           .map((gap) => describeResearchGap(gap))
@@ -2047,12 +2062,18 @@ function GwyAnalysisPage() {
                                 </div>
                               </div>
                               <div className="flex flex-wrap gap-2">
-                                <Badge variant="outline" className="bg-slate-50">
+                                <Badge
+                                  variant="outline"
+                                  className="bg-slate-50"
+                                >
                                   {item.history_records.length > 0
                                     ? `历史 ${item.history_records.length} 条`
                                     : "历史缺失"}
                                 </Badge>
-                                <Badge variant="outline" className="bg-slate-50">
+                                <Badge
+                                  variant="outline"
+                                  className="bg-slate-50"
+                                >
                                   外网 {item.web_results.length} 条
                                 </Badge>
                               </div>
@@ -2122,15 +2143,17 @@ function GwyAnalysisPage() {
                                   </div>
                                   {targetQueries.length > 0 ? (
                                     <div className="flex flex-wrap gap-2">
-                                      {targetQueries.slice(0, 4).map((query) => (
-                                        <Badge
-                                          key={`${item.position_id}-query-${query}`}
-                                          variant="outline"
-                                          className="border-cyan-300/40 bg-cyan-300/10 text-cyan-800"
-                                        >
-                                          {query}
-                                        </Badge>
-                                      ))}
+                                      {targetQueries
+                                        .slice(0, 4)
+                                        .map((query) => (
+                                          <Badge
+                                            key={`${item.position_id}-query-${query}`}
+                                            variant="outline"
+                                            className="border-cyan-300/40 bg-cyan-300/10 text-cyan-800"
+                                          >
+                                            {query}
+                                          </Badge>
+                                        ))}
                                       {targetQueries.length > 4 ? (
                                         <Badge
                                           variant="outline"
@@ -2196,7 +2219,9 @@ function GwyAnalysisPage() {
                                             {title}
                                           </div>
                                           <div className="mt-1 text-[11px] text-slate-500">
-                                            {url ? truncateUrl(url) : "暂无链接"}
+                                            {url
+                                              ? truncateUrl(url)
+                                              : "暂无链接"}
                                           </div>
                                           {snippet ? (
                                             <div className="mt-1 text-[11px] leading-5 text-slate-600">
@@ -2348,11 +2373,16 @@ function GwyAnalysisPage() {
                           <div className="min-w-0">
                             <div className="flex items-center gap-2">
                               <span className="text-sm font-medium text-slate-900">
-                                {item.step}
+                                {formatTraceTitle(item)}
                               </span>
                               <Badge variant="outline" className="bg-slate-50">
                                 {item.status}
                               </Badge>
+                              {item.event ? (
+                                <Badge variant="outline" className="bg-sky-50">
+                                  {item.event}
+                                </Badge>
+                              ) : null}
                               {item.query ? (
                                 <Badge
                                   variant="outline"
@@ -2485,6 +2515,8 @@ function TraceField({
 
 function TraceSummaryCards({ item }: { item: AnalysisTraceEntry }) {
   const items = [
+    item.turn !== undefined ? `Turn: ${item.turn}` : null,
+    item.tool ? `Tool: ${item.tool}` : null,
     item.query ? `查询词: ${item.query}` : null,
     item.query_index !== undefined ? `检索组: ${item.query_index}` : null,
     item.attempt_index !== undefined ? `尝试: ${item.attempt_index}` : null,
@@ -2508,6 +2540,19 @@ function TraceSummaryCards({ item }: { item: AnalysisTraceEntry }) {
       ))}
     </div>
   )
+}
+
+function formatTraceTitle(item: AnalysisTraceEntry): string {
+  if (item.tool) {
+    return item.tool
+  }
+  if (item.step) {
+    return item.step
+  }
+  if (item.event) {
+    return item.event
+  }
+  return "agent_step"
 }
 
 function TraceEvidenceRefs({ refs }: { refs: AnalysisEvidence[] }) {
@@ -2790,16 +2835,35 @@ function normalizeTraceEntry(item: unknown): AnalysisTraceEntry | null {
     return null
   }
   const candidate = item as Record<string, unknown>
+  const rawInput = isRecord(candidate.input)
+    ? (candidate.input as Record<string, unknown>)
+    : {}
+  const rawOutput = isRecord(candidate.output)
+    ? (candidate.output as Record<string, unknown>)
+    : {}
+  const inputsSummary = isRecord(candidate.inputs_summary)
+    ? (candidate.inputs_summary as Record<string, unknown>)
+    : rawInput
+  const outputsSummary = isRecord(candidate.outputs_summary)
+    ? (candidate.outputs_summary as Record<string, unknown>)
+    : rawOutput
   const evidenceRefs = Array.isArray(candidate.evidence_refs)
     ? candidate.evidence_refs
         .map((ref) => normalizeEvidence(ref))
         .filter((ref): ref is AnalysisEvidence => ref !== null)
     : []
+  const event = String(candidate.event ?? "")
+  const tool =
+    candidate.tool === undefined ? undefined : String(candidate.tool ?? "")
+  const step = String(candidate.step ?? tool ?? event ?? "")
   return {
-    step: String(candidate.step ?? ""),
+    event,
+    step,
+    tool,
     status: String(candidate.status ?? ""),
     detail: String(candidate.detail ?? ""),
     elapsed_ms: Number(candidate.elapsed_ms ?? 0),
+    turn: candidate.turn === undefined ? undefined : Number(candidate.turn),
     query:
       candidate.query === undefined ? undefined : String(candidate.query ?? ""),
     query_index:
@@ -2830,12 +2894,10 @@ function normalizeTraceEntry(item: unknown): AnalysisTraceEntry | null {
       candidate.retry_count === undefined
         ? undefined
         : Number(candidate.retry_count),
-    inputs_summary: isRecord(candidate.inputs_summary)
-      ? (candidate.inputs_summary as Record<string, unknown>)
-      : {},
-    outputs_summary: isRecord(candidate.outputs_summary)
-      ? (candidate.outputs_summary as Record<string, unknown>)
-      : {},
+    inputs_summary: inputsSummary,
+    outputs_summary: outputsSummary,
+    raw_input: rawInput,
+    raw_output: rawOutput,
     evidence_refs: evidenceRefs,
   }
 }
@@ -3190,7 +3252,10 @@ function StudyPlanPanel({ studyPlan }: { studyPlan: StudyPlanData | null }) {
   const subjects = [...(studyPlan?.subjects ?? [])].sort((left, right) => {
     const leftWeight = Number(left.weight_percent ?? 0)
     const rightWeight = Number(right.weight_percent ?? 0)
-    return rightWeight - leftWeight || left.subject_name.localeCompare(right.subject_name)
+    return (
+      rightWeight - leftWeight ||
+      left.subject_name.localeCompare(right.subject_name)
+    )
   })
   const tasks = [...(studyPlan?.tasks ?? [])].sort((left, right) => {
     return (
@@ -3242,7 +3307,10 @@ function StudyPlanPanel({ studyPlan }: { studyPlan: StudyPlanData | null }) {
         <>
           <div className="mt-4 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
             <PlanStat label="规划标题" value={title} />
-            <PlanStat label="考试年份 / 类型" value={`${examYear} · ${examType}`} />
+            <PlanStat
+              label="考试年份 / 类型"
+              value={`${examYear} · ${examType}`}
+            />
             <PlanStat label="总周数" value={`${totalWeeks} 周`} />
             <PlanStat label="每日学习时长" value={`${hoursPerDay} 小时`} />
           </div>
@@ -3256,7 +3324,9 @@ function StudyPlanPanel({ studyPlan }: { studyPlan: StudyPlanData | null }) {
                 {phases.length > 0 ? (
                   phases.slice(0, 4).map((phase) => (
                     <div
-                      key={phase.id || `${phase.phase_order}-${phase.phase_name}`}
+                      key={
+                        phase.id || `${phase.phase_order}-${phase.phase_name}`
+                      }
                       className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3"
                     >
                       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -3265,7 +3335,8 @@ function StudyPlanPanel({ studyPlan }: { studyPlan: StudyPlanData | null }) {
                             {phase.phase_name || `第 ${phase.phase_order} 阶段`}
                           </div>
                           <div className="mt-1 text-xs text-slate-500">
-                            第 {formatUnknown(phase.week_start)}-{formatUnknown(phase.week_end)} 周
+                            第 {formatUnknown(phase.week_start)}-
+                            {formatUnknown(phase.week_end)} 周
                           </div>
                         </div>
                         <Badge variant="outline" className="bg-white">
@@ -3278,7 +3349,11 @@ function StudyPlanPanel({ studyPlan }: { studyPlan: StudyPlanData | null }) {
                       {phase.focus_subjects.length > 0 ? (
                         <div className="mt-2 flex flex-wrap gap-2">
                           {phase.focus_subjects.map((item) => (
-                            <Badge key={item} variant="outline" className="bg-white">
+                            <Badge
+                              key={item}
+                              variant="outline"
+                              className="bg-white"
+                            >
                               {item}
                             </Badge>
                           ))}
@@ -3319,7 +3394,9 @@ function StudyPlanPanel({ studyPlan }: { studyPlan: StudyPlanData | null }) {
                         </Badge>
                       </div>
                       <div className="mt-2 grid gap-2 text-xs text-slate-600 md:grid-cols-2">
-                        <div>总时长: {formatUnknown(subject.total_hours)} 小时</div>
+                        <div>
+                          总时长: {formatUnknown(subject.total_hours)} 小时
+                        </div>
                         <div>清单: {subject.checklist_items.length} 项</div>
                       </div>
                       {subject.checklist_items.length > 0 ? (
@@ -3360,19 +3437,24 @@ function StudyPlanPanel({ studyPlan }: { studyPlan: StudyPlanData | null }) {
                 {tasks.length > 0 ? (
                   tasks.slice(0, 5).map((task) => (
                     <div
-                      key={task.id || `${task.week_number}-${task.day_of_week}-${task.task_title}`}
+                      key={
+                        task.id ||
+                        `${task.week_number}-${task.day_of_week}-${task.task_title}`
+                      }
                       className="rounded-2xl border border-slate-200 bg-slate-50 px-4 py-3"
                     >
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <div className="text-sm font-medium text-slate-900">
-                          第 {formatUnknown(task.week_number)} 周 · 第 {formatUnknown(task.day_of_week)} 天
+                          第 {formatUnknown(task.week_number)} 周 · 第{" "}
+                          {formatUnknown(task.day_of_week)} 天
                         </div>
                         <Badge variant="outline" className="bg-white">
                           {task.completed ? "已完成" : "待执行"}
                         </Badge>
                       </div>
                       <div className="mt-1 text-sm text-slate-700">
-                        {task.subject || "未指定科目"} · {cleanStudyPlanText(task.task_title) || "未命名任务"}
+                        {task.subject || "未指定科目"} ·{" "}
+                        {cleanStudyPlanText(task.task_title) || "未命名任务"}
                       </div>
                       {cleanStudyPlanText(task.task_description) ? (
                         <div className="mt-1 text-xs leading-5 text-slate-500">
@@ -3380,7 +3462,8 @@ function StudyPlanPanel({ studyPlan }: { studyPlan: StudyPlanData | null }) {
                         </div>
                       ) : null}
                       <div className="mt-2 text-xs text-slate-500">
-                        预计 {formatUnknown(task.estimated_minutes)} 分钟 · 优先级 {formatUnknown(task.priority)}
+                        预计 {formatUnknown(task.estimated_minutes)} 分钟 ·
+                        优先级 {formatUnknown(task.priority)}
                       </div>
                     </div>
                   ))
@@ -3463,7 +3546,9 @@ function PlanStat({ label, value }: { label: string; value: string }) {
 }
 
 function formatStudyPlanExamType(value: unknown): string {
-  const text = String(value ?? "").trim().toLowerCase()
+  const text = String(value ?? "")
+    .trim()
+    .toLowerCase()
   if (!text) {
     return "未说明"
   }

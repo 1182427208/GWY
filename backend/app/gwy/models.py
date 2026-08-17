@@ -412,6 +412,52 @@ class GwyHumanReview(GwyTimestampMixin, table=True):
     decision_json: dict[str, Any] = Field(default_factory=dict, sa_type=JSON)
 
 
+class GwyEvalDataset(GwyTimestampMixin, table=True):
+    __tablename__ = "gwy_eval_dataset"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: uuid.UUID | None = Field(default=None, foreign_key="user.id", index=True)
+    name: str = Field(max_length=255, index=True)
+    version: str = Field(default="1", max_length=64)
+    split: str = Field(default="dev", max_length=32, index=True)
+    task_type: str = Field(default="e2e", max_length=32, index=True)
+    status: str = Field(default="draft", max_length=32, index=True)
+    cases_json: list[dict[str, Any]] = Field(default_factory=list, sa_type=JSON)
+    metadata_json: dict[str, Any] = Field(default_factory=dict, sa_type=JSON)
+
+
+class GwyEvalRun(GwyTimestampMixin, table=True):
+    __tablename__ = "gwy_eval_run"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    user_id: uuid.UUID = Field(foreign_key="user.id", index=True)
+    dataset_id: uuid.UUID | None = Field(default=None, foreign_key="gwy_eval_dataset.id", index=True)
+    source_type: str = Field(default="online", max_length=32, index=True)
+    source_id: str | None = Field(default=None, max_length=128, index=True)
+    task_type: str = Field(default="e2e", max_length=32, index=True)
+    status: str = Field(default="running", max_length=32, index=True)
+    query: str = Field(default="")
+    config_json: dict[str, Any] = Field(default_factory=dict, sa_type=JSON)
+    summary_json: dict[str, Any] = Field(default_factory=dict, sa_type=JSON)
+    report_text: str | None = Field(default=None)
+    started_at: datetime | None = Field(default_factory=get_datetime_utc, sa_type=DateTime(timezone=True))
+    finished_at: datetime | None = Field(default=None, sa_type=DateTime(timezone=True))
+
+
+class GwyEvalCaseResult(GwyTimestampMixin, table=True):
+    __tablename__ = "gwy_eval_case_result"
+
+    id: uuid.UUID = Field(default_factory=uuid.uuid4, primary_key=True)
+    run_id: uuid.UUID = Field(foreign_key="gwy_eval_run.id", index=True)
+    case_id: str = Field(max_length=128, index=True)
+    status: str = Field(default="failed", max_length=32, index=True)
+    passed: bool = False
+    scores_json: dict[str, Any] = Field(default_factory=dict, sa_type=JSON)
+    observation_json: dict[str, Any] = Field(default_factory=dict, sa_type=JSON)
+    failure_reasons: list[str] = Field(default_factory=list, sa_type=JSON)
+    trace_json: list[dict[str, Any]] = Field(default_factory=list, sa_type=JSON)
+
+
 # Study Plan models
 
 

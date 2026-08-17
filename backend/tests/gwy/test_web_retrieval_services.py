@@ -5,8 +5,11 @@ from typing import Any
 
 import pytest
 
+from app.core.config import settings
 from app.gwy.services.playwright_mcp_service import PlaywrightMCPService
+from app.gwy.services.web_mcp_client import WebMCPClient
 from app.gwy.services.web_fetch_service import WebFetchService
+from app.gwy.services.web_research_service import WebResearchRequest, WebResearchService
 from app.gwy.services.web_search_service import WebSearchService
 
 
@@ -217,3 +220,126 @@ def test_playwright_mcp_service_falls_back_to_local_playwright(
 
     assert result["title"] == "Local Title"
     assert result["retrieved_via"] == "playwright_local"
+
+
+def test_web_search_service_prefers_unified_web_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "WEB_MCP_URL", "http://web-mcp:8001/mcp")
+    monkeypatch.setattr(
+        WebMCPClient,
+        "search",
+        lambda self, query, top_k=5: {
+            "query": query,
+            "results": [
+                {
+                    "title": "Remote Search",
+                    "url": "https://example.com/remote",
+                    "snippet": "Remote snippet",
+                    "source": "web_mcp",
+                }
+            ],
+        },
+    )
+
+    service = WebSearchService(web_mcp_enabled=True, http_client=DummyHttpClient(DummyResponse(text="")))
+    results = service.search("统一 MCP", top_k=1)
+
+    assert len(results) == 1
+    assert results[0]["title"] == "Remote Search"
+    assert results[0]["source"] == "web_mcp"
+
+
+def test_web_fetch_service_prefers_unified_web_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "WEB_MCP_URL", "http://web-mcp:8001/mcp")
+    monkeypatch.setattr(
+        WebMCPClient,
+        "fetch",
+        lambda self, url, max_chars=20000: {
+            "url": url,
+            "final_url": url,
+            "title": "Remote Title",
+            "text": "Remote body",
+            "content_type": "text/html",
+            "status_code": 200,
+            "retrieved_via": "fetch_mcp",
+            "is_pdf": False,
+        },
+    )
+
+    service = WebFetchService(http_client=DummyHttpClient(DummyResponse(text="")))
+    result = service.fetch("https://example.com/remote-page")
+
+    assert result["title"] == "Remote Title"
+    assert result["retrieved_via"] == "fetch_mcp"
+
+
+def test_playwright_mcp_service_prefers_unified_web_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "WEB_MCP_URL", "http://web-mcp:8001/mcp")
+    monkeypatch.setattr(
+        WebMCPClient,
+        "read",
+        lambda self, url, selector="body", wait_ms=800, max_chars=20000: {
+            "url": url,
+            "final_url": url,
+            "title": "Remote Rendered",
+            "text": "Remote rendered content",
+            "content_type": "text/html",
+            "status_code": 200,
+            "retrieved_via": "web_mcp:browser_retrieve",
+        },
+    )
+
+    service = PlaywrightMCPService(endpoint_url="", web_mcp_enabled=True)
+    result = service.read("https://example.com/dynamic")
+
+    assert result["title"] == "Remote Rendered"
+    assert result["retrieved_via"] == "web_mcp:browser_retrieve"
+
+
+def test_web_research_service_prefers_unified_web_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "WEB_MCP_URL", "http://web-mcp:8001/mcp")
+    monkeypatch.setattr(
+        WebMCPClient,
+        "verify",
+        lambda self, query, planned_queries=None, top_k=3, seed_urls=None: {
+            "evidence": [
+                {
+                    "title": "Policy Notice",
+                    "url": "https://gov.example/notice",
+                    "final_url": "https://gov.example/notice",
+                    "source_domain": "gov.example",
+                    "published_at": "2026-08-02T00:00:00Z",
+                    "retrieved_at": "2026-08-02T00:00:01Z",
+                    "excerpt": "Evidence snippet",
+                    "evidence_type": "web_page",
+                    "credibility": "high",
+                    "retrieved_via": "web_mcp",
+                    "text": "Evidence body",
+                }
+            ],
+            "failures": [],
+            "trace": [{"step": "remote", "status": "done"}],
+            "attempts": [{"query": query, "hit_count": 1}],
+            "insufficient_evidence": False,
+        },
+    )
+
+    service = WebResearchService(web_mcp_enabled=True)
+    result = service.verify(
+        WebResearchRequest(
+            query="统一 MCP 改造",
+            planned_queries=["统一 MCP"],
+            seed_urls=["https://gov.example/notice"],
+            top_k=1,
+        )
+    )
+
+    assert result.evidence[0].title == "Policy Notice"
+    assert result.trace[0]["step"] == "remote"
